@@ -75,6 +75,12 @@ struct dma_buf_sync {
 	__u64 flags;
 };
 
+struct dma_buf_create_pages_info {
+	__u64 ifindex;
+	__s32 dmabuf_fd;
+	__u64 queue_mask;
+};
+
 #define DMA_BUF_SYNC_READ      (1 << 0)
 #define DMA_BUF_SYNC_WRITE     (2 << 0)
 #define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
@@ -178,5 +184,7 @@ struct dma_buf_import_sync_file {
 #define DMA_BUF_SET_NAME_B	_IOW(DMA_BUF_BASE, 1, __u64)
 #define DMA_BUF_IOCTL_EXPORT_SYNC_FILE	_IOWR(DMA_BUF_BASE, 2, struct dma_buf_export_sync_file)
 #define DMA_BUF_IOCTL_IMPORT_SYNC_FILE	_IOW(DMA_BUF_BASE, 3, struct dma_buf_import_sync_file)
+
+#define DMA_BUF_CREATE_PAGES	_IOW(DMA_BUF_BASE, 2, struct dma_buf_create_pages_info)
 
 #endif
