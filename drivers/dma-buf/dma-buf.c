@@ -24,15 +24,19 @@
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
 #include <linux/sync_file.h>
+#include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/dma-resv.h>
 #include <linux/mm.h>
 #include <linux/mount.h>
 #include <linux/pseudo_fs.h>
+#include <linux/netdevice.h>
+#include <linux/rtnetlink.h>
 
 #include <uapi/linux/dma-buf.h>
 #include <uapi/linux/magic.h>
 
+#include "../../net/core/devmem.h"
 #include "dma-buf-sysfs-stats.h"
 
 static inline int is_dma_buf_file(struct file *);
@@ -511,6 +515,8 @@ static long dma_buf_import_sync_file(struct dma_buf *dmabuf,
 	return ret;
 }
 #endif
+static long dma_buf_create_pages(struct file *file,
+				 struct dma_buf_create_pages_info *create_info);
 
 static long dma_buf_ioctl(struct file *file,
 			  unsigned int cmd, unsigned long arg)
@@ -518,6 +524,7 @@ static long dma_buf_ioctl(struct file *file,
 	struct dma_buf *dmabuf;
 	struct dma_buf_sync sync;
 	enum dma_data_direction direction;
+	struct dma_buf_create_pages_info create_info;
 	int ret;
 
 	dmabuf = file->private_data;
@@ -554,6 +561,12 @@ static long dma_buf_ioctl(struct file *file,
 	case DMA_BUF_SET_NAME_A:
 	case DMA_BUF_SET_NAME_B:
 		return dma_buf_set_name(dmabuf, (const char __user *)arg);
+	case DMA_BUF_CREATE_PAGES:
+		if (copy_from_user(&create_info, (void __user *)arg,
+				   sizeof(create_info))) {
+			return -EFAULT;
+		}
+		return dma_buf_create_pages(file, &create_info);
 
 #if IS_ENABLED(CONFIG_SYNC_FILE)
 	case DMA_BUF_IOCTL_EXPORT_SYNC_FILE:
@@ -1611,6 +1624,97 @@ void dma_buf_vunmap_unlocked(struct dma_buf *dmabuf, struct iosys_map *map)
 	dma_resv_unlock(dmabuf->resv);
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_vunmap_unlocked, "DMA_BUF");
+
+#ifdef CONFIG_ZONE_DEVICE
+
+static int dma_buf_pages_release(struct inode *inode, struct file *file)
+{
+	rtnl_lock();
+	net_devmem_unbind_dmabuf(file->private_data);
+	rtnl_unlock();
+	return 0;
+}
+
+const struct file_operations dma_buf_pages_fops = {
+	.release	= dma_buf_pages_release,
+};
+EXPORT_SYMBOL_GPL(dma_buf_pages_fops);
+
+static long dma_buf_create_pages(struct file *file,
+				 struct dma_buf_create_pages_info *create_info)
+{
+	struct net_devmem_dmabuf_binding *binding;
+	u32 ifindex, dmabuf_fd, rxq_idx;
+	struct net_device *netdev;
+	struct file *new_file;
+	int err = 0;
+	int fd;
+
+	ifindex = create_info->ifindex;
+	dmabuf_fd = create_info->dmabuf_fd;
+
+	rtnl_lock();
+
+	netdev = __dev_get_by_index(current->nsproxy->net_ns, ifindex);
+	if (!netdev) {
+		err = -ENODEV;
+		goto err_unlock;
+	}
+
+	mina_debug(0, 1, "binding to netdev=%s, queue_mask=0x%llx", netdev->name,
+			create_info->queue_mask);
+
+	binding = net_devmem_bind_dmabuf(netdev, DMA_FROM_DEVICE, dmabuf_fd,
+					 NULL, NULL);
+	if (IS_ERR(binding)) {
+		err = PTR_ERR(binding);
+		goto err_unlock;
+	}
+
+	for (rxq_idx = 0; rxq_idx < 16; rxq_idx++) {
+		if (create_info->queue_mask & (0x1ULL << rxq_idx)) {
+			mina_debug(0, 1, "binding queue=%d", rxq_idx);
+			if (rxq_idx >= netdev->num_rx_queues) {
+				err = -ERANGE;
+				mina_debug(0, 1, "failed: %d", err);
+				goto err_unbind;
+			}
+
+			err = net_devmem_bind_dmabuf_to_queue(netdev, rxq_idx,
+							  binding, NULL);
+			if (err)
+				goto err_unbind;
+		}
+	}
+
+	rtnl_unlock();
+
+	new_file = anon_inode_getfile("[dma_buf_pages]", &dma_buf_pages_fops,
+			(void *)binding, O_RDWR | O_CLOEXEC);
+	if (IS_ERR(new_file))
+		BUG();
+
+       fd = get_unused_fd_flags(O_RDWR | O_CLOEXEC);
+       if (fd < 0)
+	       BUG();
+
+	fd_install(fd, new_file);
+	return fd;
+
+err_unbind:
+	net_devmem_unbind_dmabuf(binding);
+err_unlock:
+	rtnl_unlock();
+	mina_debug(0, 1, "failed: %d", err);
+	return err;
+}
+#else
+static long dma_buf_create_pages(struct file *file,
+				 struct dma_buf_create_pages_info *create_info)
+{
+	return -ENOTSUPP;
+}
+#endif
 
 #ifdef CONFIG_DEBUG_FS
 static int dma_buf_debug_show(struct seq_file *s, void *unused)

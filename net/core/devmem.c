@@ -300,7 +300,8 @@ net_devmem_bind_dmabuf(struct net_device *dev,
 	if (err < 0)
 		goto err_free_chunks;
 
-	list_add(&binding->list, &priv->bindings);
+	if (priv)
+		list_add(&binding->list, &priv->bindings);
 
 	return binding;
 
