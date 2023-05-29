@@ -403,3 +403,13 @@ static inline void ftrace_dump(enum ftrace_dump_mode oops_dump_mode) { }
 	 BUILD_BUG_ON_ZERO((perms) & 2) +					\
 	 (perms))
 #endif
+
+#define mina_debug(dump_stack, cond, fmt, ...)                                \
+	if (cond) {                                                           \
+		pr_err_ratelimited("%s:%d:%s: " fmt "\n", __FILE__, __LINE__, \
+				   __func__, ##__VA_ARGS__);                  \
+		trace_printk("%s:%d:%s: " fmt "\n", __FILE__, __LINE__,       \
+			     __func__, ##__VA_ARGS__);                        \
+		if (dump_stack)                                               \
+			trace_dump_stack(0);                                  \
+	}
