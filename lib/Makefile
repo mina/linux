@@ -363,3 +363,9 @@ obj-$(CONFIG_GENERIC_LIB_DEVMEM_IS_ALLOWED) += devmem_is_allowed.o
 obj-$(CONFIG_FIRMWARE_TABLE) += fw_table.o
 
 subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
+
+ifeq ($(CONFIG_MODULES),y)
+obj-m	+= bench_page_pool_simple.o
+bench_page_pool_simple-y := bench/bench_page_pool_simple.o
+obj-y	+= bench/time_bench.o
+endif

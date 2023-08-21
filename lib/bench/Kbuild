@@ -1,0 +1,1 @@
+bench_page_pool_simple-y := bench_page_pool_simple.o bench_page_pool_cross_cpu.o
