@@ -1,0 +1,105 @@
+#! /bin/sh
+#
+#
+set -ex
+
+alias staging_gcloud='/google/data/ro/teams/cloud-sdk/gcloud'
+
+instance1=$1
+instance2=$2
+
+random_port=$((RANDOM%100+5201))
+echo $random_port
+
+
+sudo make headers_install
+sudo CFLAGS="-static -Wall" make -C ./tools/testing/selftests/drivers/net/hw TARGETS=ncdevmem
+
+set +e
+staging_gcloud compute scp ./tools/testing/selftests/drivers/net/hw/ncdevmem $instance1:~/
+staging_gcloud compute scp ./tools/testing/selftests/drivers/net/hw/ncdevmem $instance2:~/
+set -e
+
+CLIENT=$(staging_gcloud compute ssh $instance2 -- "ifconfig | grep -i 'inet 192.168.1.'" | awk '{print $2}')
+SERVER=$(staging_gcloud compute ssh $instance1 -- "ifconfig | grep -i 'inet 192.168.1.'" | awk '{print $2}')
+
+sed -i "s/SERVER/$SERVER/g" scripts/rx_server
+sed -i "s/CLIENT/$CLIENT/g" scripts/rx_server
+sed -i "s/SERVER/$SERVER/g" scripts/rx_client
+sed -i "s/CLIENT/$CLIENT/g" scripts/rx_client
+
+sed -i "s/SERVER/$SERVER/g" scripts/tx_server
+sed -i "s/CLIENT/$CLIENT/g" scripts/tx_server
+sed -i "s/SERVER/$SERVER/g" scripts/tx_client
+sed -i "s/CLIENT/$CLIENT/g" scripts/tx_client
+
+sed -i "s/SERVER/$SERVER/g" scripts/rxtx_server
+sed -i "s/CLIENT/$CLIENT/g" scripts/rxtx_server
+sed -i "s/SERVER/$SERVER/g" scripts/rxtx_client
+sed -i "s/CLIENT/$CLIENT/g" scripts/rxtx_client
+
+sed -i "s/SERVER/$SERVER/g" scripts/tcp_stream_server
+sed -i "s/CLIENT/$CLIENT/g" scripts/tcp_stream_server
+sed -i "s/SERVER/$SERVER/g" scripts/tcp_stream_client
+sed -i "s/CLIENT/$CLIENT/g" scripts/tcp_stream_client
+
+staging_gcloud compute scp scripts/rx_server $instance1:~/
+staging_gcloud compute scp scripts/rx_client $instance2:~/
+
+staging_gcloud compute scp scripts/tx_server $instance1:~/
+staging_gcloud compute scp scripts/tx_client $instance2:~/
+
+staging_gcloud compute scp scripts/rxtx_server $instance1:~/
+staging_gcloud compute scp scripts/rxtx_client $instance2:~/
+
+staging_gcloud compute scp scripts/tcp_stream_server $instance1:~/
+staging_gcloud compute scp scripts/tcp_stream_client $instance2:~/
+
+# staging_gcloud compute scp ./lib/bench_page_pool_simple.ko $instance1:~/
+# staging_gcloud compute scp ./lib/bench_page_pool_simple.ko $instance2:~/
+
+staging_gcloud compute scp ./scripts/tcp_stream $instance1:~/
+staging_gcloud compute scp ./scripts/tcp_stream $instance2:~/
+
+staging_gcloud compute scp ./scripts/ethtool $instance1:~/
+staging_gcloud compute scp ./scripts/ethtool $instance2:~/
+
+sed -i "s/$SERVER/SERVER/g" scripts/rx_server
+sed -i "s/$CLIENT/CLIENT/g" scripts/rx_server
+sed -i "s/$SERVER/SERVER/g" scripts/rx_client
+sed -i "s/$CLIENT/CLIENT/g" scripts/rx_client
+
+sed -i "s/$SERVER/SERVER/g" scripts/rxtx_server
+sed -i "s/$CLIENT/CLIENT/g" scripts/rxtx_server
+sed -i "s/$SERVER/SERVER/g" scripts/rxtx_client
+sed -i "s/$CLIENT/CLIENT/g" scripts/rxtx_client
+
+sed -i "s/$SERVER/SERVER/g" scripts/tx_server
+sed -i "s/$CLIENT/CLIENT/g" scripts/tx_server
+sed -i "s/$SERVER/SERVER/g" scripts/tx_client
+sed -i "s/$CLIENT/CLIENT/g" scripts/tx_client
+
+sed -i "s/$SERVER/SERVER/g" scripts/tcp_stream_server
+sed -i "s/$CLIENT/CLIENT/g" scripts/tcp_stream_server
+sed -i "s/$SERVER/SERVER/g" scripts/tcp_stream_client
+sed -i "s/$CLIENT/CLIENT/g" scripts/tcp_stream_client
+
+<<FUB
+staging_gcloud compute scp ./tools/net/ynl/ \
+  $instance1:~/ --recurse
+staging_gcloud compute scp ./Documentation/netlink/specs/netdev.yaml \
+  $instance1:~/ynl/ --recurse
+gcloud compute scp ./Documentation/netlink $instance1:~/ --recurse
+FUB
+
+staging_gcloud compute ssh $instance1 -- \
+  "sudo mount -o remount,exec /home && \
+   sudo iptables -I INPUT -p tcp -m tcp -j ACCEPT && \
+   sudo ~/ethtool -K eth1 ntuple on || true && \
+   sudo ~/ethtool -G eth1 tcp-data-split on"
+
+staging_gcloud compute ssh $instance2 -- \
+  "sudo mount -o remount,exec /home && \
+   sudo iptables -I INPUT -p tcp -m tcp -j ACCEPT && \
+   sudo ~/ethtool -K eth1 ntuple on || true && \
+   sudo ~/ethtool -G eth1 tcp-data-split on"

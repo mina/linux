@@ -1,0 +1,6 @@
+#! /bin/sh
+#
+#
+set -ex
+
+./ncdevmem -s SERVER -c CLIENT -l -p 5201 -v 7 -f eth1

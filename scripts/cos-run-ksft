@@ -56,5 +56,9 @@ gcloud compute ssh $instance2 -- \
    sudo chmod 777 /dev/udmabuf"
 
 gcloud compute ssh $instance1 << EOF
+<<<<<<< HEAD
   sudo chmod 777 /dev/udmabuf && cd ~/cos-run-ksft && sudo ./run_kselftest.sh -t drivers/net/hw:devmem.py -o 60
+=======
+  sudo chmod 777 /dev/udmabuf && cd ~/cos-run-ksft && sudo ./run_kselftest.sh -t drivers/net/hw:devmem.py -o 30
+>>>>>>> 42fabb040afc ([not-for-review] cos test scripts)
 EOF
