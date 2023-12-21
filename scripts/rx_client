@@ -1,0 +1,6 @@
+#! /bin/sh
+#
+#
+set -ex
+
+yes $(echo -e \\x01\\x02\\x03\\x04\\x05\\x06) | head -c 1G | nc SERVER 5201 -p 5201

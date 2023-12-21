@@ -1,0 +1,7 @@
+#! /bin/sh
+#
+#
+set -ex
+
+ulimit -n 10000
+./tcp_stream -c -H SERVER -P 5201 -r -T 400 -F 8000

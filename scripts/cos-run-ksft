@@ -1,0 +1,60 @@
+#! /bin/sh
+#
+#
+set -ex
+
+alias gcloud='/google/data/ro/teams/cloud-sdk/gcloud'
+
+instance1=$1
+instance2=$2
+
+random_port=$((RANDOM%100+5201))
+echo $random_port
+
+mkdir -p /tmp/cos-run-ksft
+
+sudo make headers_install
+sudo make -C ./tools/net/ynl
+sudo CFLAGS="-static -Wall" make -C ./tools/testing/selftests/drivers/net/hw TARGETS=ncdevmem
+sudo CFLAGS="-static -Wall" make -C tools/testing/selftests TARGETS="drivers/net/hw" install INSTALL_PATH=/tmp/cos-run-ksft
+
+SERVER_EXTERNAL="nic0.$instance1.us-east5-a.c.supercomputer-testing.internal.gcpnode.com"
+CLIENT_EXTERNAL="nic0.$instance2.us-east5-a.c.supercomputer-testing.internal.gcpnode.com"
+
+LOCAL=$(gcloud compute instances describe $instance1 | grep -i "networkIP: 192.168.1" | awk '{print $2}')
+REMOTE=$(gcloud compute instances describe $instance2 | grep -i "networkIP: 192.168.1" | awk '{print $2}')
+REMOTE_0=$(gcloud compute instances describe $instance2 | grep -i "networkIP: 192.168.0" | awk '{print $2}')
+
+cat > /tmp/cos-run-ksft/drivers/net/hw/net.config <<EOF
+NETIF=eth1
+LOCAL_V4=$LOCAL
+REMOTE_V4=$REMOTE
+REMOTE_TYPE=ssh
+REMOTE_ARGS=almasrymina_google_com@$REMOTE_0
+EOF
+
+
+CORP_SSH_HELPER_OVERRIDES= time rsync -avz --progress --exclude '.git/*' \
+  /tmp/cos-run-ksft almasrymina_google_com@$SERVER_EXTERNAL:~/
+CORP_SSH_HELPER_OVERRIDES= time rsync -avz --progress --exclude '.git/*' \
+  /tmp/cos-run-ksft almasrymina_google_com@$CLIENT_EXTERNAL:~/
+
+<<FUB
+gcloud compute ssh $instance1 -- \
+  "sudo mount -o remount,exec /home && \
+   sudo iptables -I INPUT -p tcp -m tcp -j ACCEPT && \
+   sudo /home/almasrymina/ethtool -K eth1 ntuple on || true && \
+   sudo /home/almasrymina/ethtool -G eth1 tcp-data-split on && \
+   sudo chmod 777 /dev/udmabuf"
+
+gcloud compute ssh $instance2 -- \
+  "sudo mount -o remount,exec /home && \
+   sudo iptables -I INPUT -p tcp -m tcp -j ACCEPT && \
+   sudo /home/almasrymina/ethtool -K eth1 ntuple on || true && \
+   sudo /home/almasrymina/ethtool -G eth1 tcp-data-split on && \
+   sudo chmod 777 /dev/udmabuf"
+FUB
+
+gcloud compute ssh $instance1 << EOF
+  sudo chmod 777 /dev/udmabuf && cd ~/cos-run-ksft && sudo ./run_kselftest.sh -t drivers/net/hw:devmem.py -o 30
+EOF

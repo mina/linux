@@ -1,0 +1,6 @@
+#! /bin/sh
+#
+#
+set -ex
+
+yes $(echo -e \\x01\\x02\\x03\\x04\\x05\\x06\\x07) | head -c 1M | ./ncdevmem -s SERVER -c CLIENT -p 5201 -f eth1
