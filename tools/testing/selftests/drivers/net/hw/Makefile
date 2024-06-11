@@ -20,6 +20,7 @@ TEST_PROGS = \
 	rss_input_xfrm.py \
 	tso.py \
 	xsk_reconfig.py \
+	xsk_hw.py \
 	#
 
 TEST_FILES := \
