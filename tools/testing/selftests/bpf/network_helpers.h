@@ -88,6 +88,7 @@ int get_hw_ring_size(char *ifname, struct ethtool_ringparam *ring_param);
 int set_hw_ring_size(char *ifname, struct ethtool_ringparam *ring_param);
 
 int open_tuntap(const char *dev_name, bool need_mac);
+int rxq_num(const char *ifname);
 
 struct nstoken;
 /**
