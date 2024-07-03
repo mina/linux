@@ -84,7 +84,7 @@ def main():
                         const=Netlink.NLM_F_CREATE)
     parser.add_argument('--append', dest='flags', action='append_const',
                         const=Netlink.NLM_F_APPEND)
-    parser.add_argument('--process-unknown', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--process-unknown', action='store_true')
     parser.add_argument('--output-json', action='store_true')
     parser.add_argument('--dbg-small-recv', default=0, const=4000,
                         action='store', nargs='?', type=int)
