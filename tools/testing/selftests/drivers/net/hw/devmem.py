@@ -7,6 +7,7 @@ from lib.py import ksft_eq, KsftSkipEx
 from lib.py import NetDrvEpEnv
 from lib.py import bkg, cmd, rand_port, wait_port_listen
 from lib.py import ksft_disruptive
+import pprint
 
 
 def require_devmem(cfg):
@@ -54,6 +55,9 @@ def main() -> None:
         cfg.bin_local = path.abspath(path.dirname(__file__) + "/ncdevmem")
         #cfg.bin_remote = cfg.remote.deploy(cfg.bin_local)
         cfg.bin_remote = "sudo /home/almasrymina_google_com/cos-run-ksft/drivers/net/hw/ncdevmem"
+
+        pprint.pprint(vars(cfg))
+        pprint.pprint(vars(cfg.remote))
 
         ksft_run([check_rx, check_tx],
                  args=(cfg, ))
