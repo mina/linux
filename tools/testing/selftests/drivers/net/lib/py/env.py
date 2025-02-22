@@ -159,7 +159,7 @@ class NetDrvEpEnv(NetDrvEnvBase):
         self.ifindex = self.dev['ifindex']
 
         # resolve remote interface name
-        self.remote_ifname = self.resolve_remote_ifc()
+        # self.remote_ifname = self.resolve_remote_ifc()
 
         self._required_cmd = {}
 
