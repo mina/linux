@@ -93,7 +93,8 @@ def test_rxtx(cfg) -> None:
 def main() -> None:
     with NetDrvEpEnv(__file__) as cfg:
         cfg.bin_local = path.abspath(path.dirname(__file__) + "/ncdevmem")
-        cfg.bin_remote = cfg.remote.deploy(cfg.bin_local)
+        #cfg.bin_remote = cfg.remote.deploy(cfg.bin_local)
+        cfg.bin_remote = "sudo /home/almasrymina_google_com/cos-run-ksft/drivers/net/hw/ncdevmem"
 
         ksft_run([check_rx, check_tx, check_tx_chunks, test_rxtx],
                  args=(cfg, ))
