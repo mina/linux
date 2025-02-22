@@ -618,6 +618,18 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 		prefetch(buf_state->page_info.page);
 	}
 
+	if (!hsplit && !rx->ctx.skb_head &&
+	    netmem_is_net_iov(buf_state->page_info.netmem)) {
+		/* !hsplit indicates the packet is not split, and the header went
+		 * to the packet buffer. If the packet buffer is a net_iov,
+		 * those can't be easily mapped into the kernel space to
+		 * access the header required to process the packet.
+		 */
+
+		gve_free_buffer(rx, buf_state);
+		return -EFAULT;
+	}
+
 	/* Copy the header into the skb in the case of header split */
 	if (hsplit) {
 		int unsplit = 0;
@@ -644,10 +656,10 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 	}
 
 	/* Sync the portion of dma buffer for CPU to read. */
-	dma_sync_single_range_for_cpu(&priv->pdev->dev, buf_state->addr,
-				      buf_state->page_info.page_offset +
-				      buf_state->page_info.pad,
-				      buf_len, DMA_FROM_DEVICE);
+	page_pool_dma_sync_netmem_for_cpu(rx->dqo.page_pool,
+					  buf_state->page_info.netmem,
+					  buf_state->page_info.page_offset,
+					  buf_len);
 
 	/* Append to current skb if one exists. */
 	if (rx->ctx.skb_head) {
@@ -686,7 +698,8 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 		u64_stats_update_end(&rx->statss);
 	}
 
-	if (eop && buf_len <= priv->rx_copybreak) {
+	if (eop && buf_len <= priv->rx_copybreak &&
+	    (!netmem_is_net_iov(buf_state->page_info.netmem) || !buf_len)) {
 		rx->ctx.skb_head = gve_rx_copy(priv->dev, napi,
 					       &buf_state->page_info, buf_len);
 		if (unlikely(!rx->ctx.skb_head))
