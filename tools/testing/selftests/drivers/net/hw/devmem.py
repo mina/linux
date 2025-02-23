@@ -50,6 +50,32 @@ def check_tx(cfg) -> None:
     ksft_eq(socat.stdout.strip(), "hello\nworld")
 
 
+def test_rxtx(cfg) -> None:
+    require_devmem(cfg)
+
+    port = rand_port()
+
+    ncdevmem_tx = f"yes $(echo -e \x01\x02\x03\x04\x05\x06) | head -c 10K | {cfg.bin_remote} -s {cfg.addr} -p {port} -f {cfg.ifname} -c {cfg.remote_addr}"
+    ncdevmem_rx = f"{cfg.bin_remote} -l -s {cfg.addr} -p {port} -f {cfg.ifname} -c {cfg.remote_addr} -v 7"
+
+    with bkg(ncdevmem_rx, exit_wait=True) as ncdevmem_rx_proc:
+        wait_port_listen(port)
+        ncdevmem_tx_proc = cmd(ncdevmem_tx, host=cfg.remote, shell=True)
+
+    if ncdevmem_rx_proc.ret or ncdevmem_tx_proc.ret:
+        print("RX STDOUT:")
+        print(ncdevmem_rx_proc.stdout)
+        print("RX STDERR:")
+        print(ncdevmem_rx_proc.stderr)
+        print("TX STDOUT:")
+        print(ncdevmem_tx_proc.stdout)
+        print("TX STDERR:")
+        print(ncdevmem_tx_proc.stderr)
+
+    ksft_eq(ncdevmem_rx_proc.ret, 0)
+    ksft_eq(ncdevmem_tx_proc.ret, 0)
+
+
 def main() -> None:
     with NetDrvEpEnv(__file__) as cfg:
         cfg.bin_local = path.abspath(path.dirname(__file__) + "/ncdevmem")
@@ -59,7 +85,7 @@ def main() -> None:
         pprint.pprint(vars(cfg))
         pprint.pprint(vars(cfg.remote))
 
-        ksft_run([check_rx, check_tx],
+        ksft_run([check_rx, check_tx, test_rxtx],
                  args=(cfg, ))
     ksft_exit()
 
