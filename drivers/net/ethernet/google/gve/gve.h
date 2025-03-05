@@ -105,7 +105,10 @@ struct gve_rx_desc_queue {
 
 /* The page info for a single slot in the RX data queue */
 struct gve_rx_slot_page_info {
-	struct page *page;
+	union {
+		struct page *page; /* QPL mode */
+		netmem_ref netmem; /* RDA mode */
+	};
 	void *page_address;
 	u32 page_offset; /* offset to write to in page */
 	unsigned int buf_size;
