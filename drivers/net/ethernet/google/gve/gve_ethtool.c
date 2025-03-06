@@ -5,6 +5,7 @@
  */
 
 #include <linux/rtnetlink.h>
+#include <net/netdev_rx_queue.h>
 #include "gve.h"
 #include "gve_adminq.h"
 #include "gve_dqo.h"
@@ -40,7 +41,8 @@ static u32 gve_get_msglevel(struct net_device *netdev)
  * as declared in enum xdp_action inside file uapi/linux/bpf.h .
  */
 static const char gve_gstrings_main_stats[][ETH_GSTRING_LEN] = {
-	"rx_packets", "rx_hsplit_pkt", "tx_packets", "rx_bytes",
+	"rx_packets", "rx_hsplit_pkt", "rx_devmem_pkts",
+	"rx_devmem_dropped", "tx_packets", "rx_bytes",
 	"tx_bytes", "rx_dropped", "tx_dropped", "tx_timeouts",
 	"rx_skb_alloc_fail", "rx_buf_alloc_fail", "rx_desc_err_dropped_pkt",
 	"rx_hsplit_unsplit_pkt",
@@ -149,13 +151,14 @@ static void
 gve_get_ethtool_stats(struct net_device *netdev,
 		      struct ethtool_stats *stats, u64 *data)
 {
-	u64 tmp_rx_pkts, tmp_rx_hsplit_pkt, tmp_rx_bytes, tmp_rx_hsplit_bytes,
+	u64 tmp_rx_pkts, tmp_rx_hsplit_pkt, tmp_rx_devmem_pkt,
+	    	tmp_rx_devmem_dropped, tmp_rx_bytes, tmp_rx_hsplit_bytes,
 		tmp_rx_skb_alloc_fail, tmp_rx_buf_alloc_fail,
 		tmp_rx_desc_err_dropped_pkt, tmp_rx_hsplit_unsplit_pkt,
 		tmp_tx_pkts, tmp_tx_bytes;
 	u64 rx_buf_alloc_fail, rx_desc_err_dropped_pkt, rx_hsplit_unsplit_pkt,
-		rx_pkts, rx_hsplit_pkt, rx_skb_alloc_fail, rx_bytes, tx_pkts, tx_bytes,
-		tx_dropped;
+		rx_pkts, rx_hsplit_pkt, rx_devmem_pkt, rx_devmem_dropped,
+	       	rx_skb_alloc_fail, rx_bytes, tx_pkts, tx_bytes,	tx_dropped;
 	int stats_idx, base_stats_idx, max_stats_idx;
 	struct stats *report_stats;
 	int *rx_qid_to_stats_idx;
@@ -196,6 +199,7 @@ gve_get_ethtool_stats(struct net_device *netdev,
 	}
 
 	for (rx_pkts = 0, rx_bytes = 0, rx_hsplit_pkt = 0,
+	     rx_devmem_pkt = 0, rx_devmem_dropped = 0,
 	     rx_skb_alloc_fail = 0, rx_buf_alloc_fail = 0,
 	     rx_desc_err_dropped_pkt = 0, rx_hsplit_unsplit_pkt = 0,
 	     ring = 0;
@@ -208,6 +212,8 @@ gve_get_ethtool_stats(struct net_device *netdev,
 				  u64_stats_fetch_begin(&priv->rx[ring].statss);
 				tmp_rx_pkts = rx->rpackets;
 				tmp_rx_hsplit_pkt = rx->rx_hsplit_pkt;
+				tmp_rx_devmem_pkt = rx->rx_devmem_pkt;
+				tmp_rx_devmem_dropped = rx->rx_devmem_dropped;
 				tmp_rx_bytes = rx->rbytes;
 				tmp_rx_skb_alloc_fail = rx->rx_skb_alloc_fail;
 				tmp_rx_buf_alloc_fail = rx->rx_buf_alloc_fail;
@@ -219,6 +225,9 @@ gve_get_ethtool_stats(struct net_device *netdev,
 						       start));
 			rx_pkts += tmp_rx_pkts;
 			rx_hsplit_pkt += tmp_rx_hsplit_pkt;
+			rx_devmem_pkt += tmp_rx_devmem_pkt;
+			rx_devmem_dropped += tmp_rx_devmem_dropped;
+
 			rx_bytes += tmp_rx_bytes;
 			rx_skb_alloc_fail += tmp_rx_skb_alloc_fail;
 			rx_buf_alloc_fail += tmp_rx_buf_alloc_fail;
@@ -245,6 +254,8 @@ gve_get_ethtool_stats(struct net_device *netdev,
 	i = 0;
 	data[i++] = rx_pkts;
 	data[i++] = rx_hsplit_pkt;
+	data[i++] = rx_devmem_pkt;
+	data[i++] = rx_devmem_dropped;
 	data[i++] = tx_pkts;
 	data[i++] = rx_bytes;
 	data[i++] = tx_bytes;
@@ -482,6 +493,7 @@ static int gve_set_channels(struct net_device *netdev,
 	struct ethtool_channels old_settings;
 	int new_tx = cmd->tx_count;
 	int new_rx = cmd->rx_count;
+	bool reset_rss = false;
 
 	gve_get_channels(netdev, &old_settings);
 
@@ -498,16 +510,14 @@ static int gve_set_channels(struct net_device *netdev,
 		return -EINVAL;
 	}
 
-	if (!netif_running(netdev)) {
-		priv->tx_cfg.num_queues = new_tx;
-		priv->rx_cfg.num_queues = new_rx;
-		return 0;
-	}
+	if (new_rx != priv->rx_cfg.num_queues &&
+	    priv->cache_rss_config && !netif_is_rxfh_configured(netdev))
+		reset_rss = true;
 
 	new_tx_cfg.num_queues = new_tx;
 	new_rx_cfg.num_queues = new_rx;
 
-	return gve_adjust_queues(priv, new_rx_cfg, new_tx_cfg);
+	return gve_adjust_queues(priv, new_rx_cfg, new_tx_cfg, reset_rss);
 }
 
 static void gve_get_ringparam(struct net_device *netdev,
@@ -855,6 +865,25 @@ static u32 gve_get_rxfh_indir_size(struct net_device *netdev)
 	return priv->rss_lut_size;
 }
 
+static void gve_get_rss_config_cache(struct gve_priv *priv,
+				     struct ethtool_rxfh_param *rxfh)
+{
+	struct gve_rss_config *rss_config = &priv->rss_config;
+
+	rxfh->hfunc = ETH_RSS_HASH_TOP;
+
+	if (rxfh->key) {
+		rxfh->key_size = priv->rss_key_size;
+		memcpy(rxfh->key, rss_config->hash_key, priv->rss_key_size);
+	}
+
+	if (rxfh->indir) {
+		rxfh->indir_size = priv->rss_lut_size;
+		memcpy(rxfh->indir, rss_config->hash_lut,
+		       priv->rss_lut_size * sizeof(*rxfh->indir));
+	}
+}
+
 static int gve_get_rxfh(struct net_device *netdev, struct ethtool_rxfh_param *rxfh)
 {
 	struct gve_priv *priv = netdev_priv(netdev);
@@ -862,18 +891,46 @@ static int gve_get_rxfh(struct net_device *netdev, struct ethtool_rxfh_param *rx
 	if (!priv->rss_key_size || !priv->rss_lut_size)
 		return -EOPNOTSUPP;
 
+	if (priv->cache_rss_config) {
+		gve_get_rss_config_cache(priv, rxfh);
+		return 0;
+	}
+
 	return gve_adminq_query_rss_config(priv, rxfh);
+}
+
+static void gve_set_rss_config_cache(struct gve_priv *priv,
+				     struct ethtool_rxfh_param *rxfh)
+{
+	struct gve_rss_config *rss_config = &priv->rss_config;
+
+	if (rxfh->key)
+		memcpy(rss_config->hash_key, rxfh->key, priv->rss_key_size);
+
+	if (rxfh->indir)
+		memcpy(rss_config->hash_lut, rxfh->indir,
+		       priv->rss_lut_size * sizeof(*rxfh->indir));
 }
 
 static int gve_set_rxfh(struct net_device *netdev, struct ethtool_rxfh_param *rxfh,
 			struct netlink_ext_ack *extack)
 {
 	struct gve_priv *priv = netdev_priv(netdev);
+	int err;
 
 	if (!priv->rss_key_size || !priv->rss_lut_size)
 		return -EOPNOTSUPP;
 
-	return gve_adminq_configure_rss(priv, rxfh);
+	err = gve_adminq_configure_rss(priv, rxfh);
+	if (err) {
+		NL_SET_ERR_MSG_MOD(extack, "Fail to configure RSS config");
+		return err;
+	}
+
+	if (priv->cache_rss_config)
+		gve_set_rss_config_cache(priv, rxfh);
+
+	return 0;
 }
 
 const struct ethtool_ops gve_ethtool_ops = {
