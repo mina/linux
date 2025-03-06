@@ -14,6 +14,9 @@
 #include <linux/slab.h>
 #include <net/ip6_checksum.h>
 #include <net/ipv6.h>
+#include <net/netdev_rx_queue.h>
+#include <net/page_pool/helpers.h>
+#include <net/page_pool/types.h>
 #include <net/tcp.h>
 
 static void gve_rx_free_hdr_bufs(struct gve_priv *priv, struct gve_rx_ring *rx)
@@ -583,6 +586,25 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 			prefetch(netmem_to_page(buf_state->page_info.netmem));
 	}
 
+	if (!hsplit && !rx->ctx.skb_head &&
+	    netmem_is_net_iov(buf_state->page_info.netmem)) {
+		/* !hsplit indicates the packet is not split, and the header went
+		 * to the packet buffer. If the packet buffer is a dma_buf
+		 * page, those can't be easily mapped into the kernel space to
+		 * access the header required to process the packet.
+		 *
+		 * In the future we may be able to map the dma_buf page to
+		 * kernel space to access the header for dma_buf providers that
+		 * support that, but for now, simply drop the packet. We expect
+		 * the TCP packets that we care about to be header split
+		 * anyway.
+		 */
+		rx->rx_devmem_dropped++;
+
+		gve_free_buffer(rx, buf_state);
+		return -EFAULT;
+	}
+
 	/* Copy the header into the skb in the case of header split */
 	if (hsplit) {
 		int unsplit = 0;
@@ -609,9 +631,10 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 	}
 
 	/* Sync the portion of dma buffer for CPU to read. */
-	dma_sync_single_range_for_cpu(&priv->pdev->dev, buf_state->addr,
-				      buf_state->page_info.page_offset,
-				      buf_len, DMA_FROM_DEVICE);
+	page_pool_dma_sync_netmem_for_cpu(rx->dqo.page_pool,
+					  buf_state->page_info.netmem,
+					  buf_state->page_info.page_offset,
+					  buf_len);
 
 	/* Append to current skb if one exists. */
 	if (rx->ctx.skb_head) {
@@ -622,7 +645,10 @@ static int gve_rx_dqo(struct napi_struct *napi, struct gve_rx_ring *rx,
 		return 0;
 	}
 
-	if (eop && buf_len <= priv->rx_copybreak) {
+	/* We can't copy dma-buf pages. Ignore any copybreak setting. */
+	if (eop && buf_len <= priv->rx_copybreak &&
+	    (!netmem_is_net_iov(buf_state->page_info.netmem) || !buf_len)) {
+
 		rx->ctx.skb_head = gve_rx_copy(priv->dev, napi,
 					       &buf_state->page_info, buf_len);
 		if (unlikely(!rx->ctx.skb_head))
@@ -712,10 +738,16 @@ static int gve_rx_complete_skb(struct gve_rx_ring *rx, struct napi_struct *napi,
 			return err;
 	}
 
-	if (skb_headlen(rx->ctx.skb_head) == 0)
+	if (skb_headlen(rx->ctx.skb_head) == 0) {
+		if (!skb_frags_readable(napi_get_frags(napi)))
+			rx->rx_devmem_pkt++;
 		napi_gro_frags(napi);
-	else
+	}
+	else {
+		if (!skb_frags_readable(rx->ctx.skb_head))
+			rx->rx_devmem_pkt++;
 		napi_gro_receive(napi, rx->ctx.skb_head);
+	}
 
 	return 0;
 }
