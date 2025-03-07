@@ -2545,6 +2545,8 @@ static inline void skb_len_add(struct sk_buff *skb, int delta)
 	skb->truesize += delta;
 }
 
+static inline netmem_ref skb_frag_netmem(const skb_frag_t *frag);
+
 /**
  * __skb_fill_netmem_desc - initialise a fragment in an skb
  * @skb: buffer containing fragment to be initialised
@@ -2561,9 +2563,23 @@ static inline void skb_len_add(struct sk_buff *skb, int delta)
 static inline void __skb_fill_netmem_desc(struct sk_buff *skb, int i,
 					  netmem_ref netmem, int off, int size)
 {
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	netmem_ref frag0_netmem;
 	struct page *page;
 
-	__skb_fill_netmem_desc_noacc(skb_shinfo(skb), i, netmem, off, size);
+	__skb_fill_netmem_desc_noacc(shinfo, i, netmem, off, size);
+
+	/* Warn if the driver is mixing and matching different memory
+	 * types in the same skb.
+	 */
+	if (shinfo->nr_frags > 0) {
+		frag0_netmem = skb_frag_netmem(&shinfo->frags[0]);
+		DEBUG_NET_WARN_ON_ONCE(skb->unreadable != netmem_is_net_iov(netmem));
+		DEBUG_NET_WARN_ON_ONCE(netmem_is_net_iov(netmem) &&
+				       netmem_is_net_iov(frag0_netmem) &&
+				       netmem_to_net_iov(netmem)->type !=
+				       netmem_to_net_iov(frag0_netmem)->type);
+	}
 
 	if (netmem_is_net_iov(netmem)) {
 		skb->unreadable = true;
