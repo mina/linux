@@ -3907,16 +3907,20 @@ static struct sk_buff *validate_xmit_unreadable_skb(struct sk_buff *skb,
 	if (likely(skb_frags_readable(skb)))
 		goto out;
 
-	if (!dev->netmem_tx)
+	if (!dev->netmem_tx) {
+		mina_debug(0, 1, "dropping skb because !netmem_tx");
 		goto out_free;
+	}
 
 	shinfo = skb_shinfo(skb);
 
 	if (shinfo->nr_frags > 0) {
 		niov = netmem_to_net_iov(skb_frag_netmem(&shinfo->frags[0]));
-		if (net_is_devmem_iov(niov) &&
-		    net_devmem_iov_binding(niov)->dev != dev)
+		// mina_debug(0, 1, "checking for matching dev... net_is_devmem_iov=%d, net_devmem_iov_binding(niov)->dev=%px, dev=%px", net_is_devmem_iov(niov), net_devmem_iov_binding(niov)->dev, dev);
+		if (net_is_devmem_iov(niov) && net_devmem_iov_binding(niov)->dev != dev) {
+			mina_debug(0, 1, "dropping skb because detected different device");
 			goto out_free;
+		}
 	}
 
 out:

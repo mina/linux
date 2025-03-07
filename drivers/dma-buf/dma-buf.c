@@ -1691,8 +1691,10 @@ static long dma_buf_create_pages(struct file *file,
 
 			err = net_devmem_bind_dmabuf_to_queue(netdev, rxq_idx,
 							  binding, NULL);
-			if (err)
+			if (err) {
+				mina_debug(0, 1, "failed binding to queue: %d", err);
 				goto err_unbind;
+			}
 		}
 	}
 
