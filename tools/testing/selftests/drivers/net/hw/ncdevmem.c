@@ -575,6 +575,8 @@ static int do_server(struct memory_buffer *mem)
 	if (bind_rx_queue(ifindex, mem->fd, create_queues(), num_queues, &ys))
 		error(1, 0, "Failed to bind\n");
 
+	sleep(2);
+
 	tmp_mem = malloc(mem->size);
 	if (!tmp_mem)
 		error(1, ENOMEM, "malloc failed");
