@@ -32,11 +32,8 @@ enum net_iov_type {
 
 struct net_iov {
 	enum net_iov_type type;
-	unsigned long pp_magic;
-	struct page_pool *pp;
+	struct netmem_desc netmem_desc;
 	struct net_iov_area *owner;
-	unsigned long dma_addr;
-	atomic_long_t pp_ref_count;
 };
 
 struct net_iov_area {
@@ -67,10 +64,7 @@ struct net_iov_area {
 #define NET_IOV_ASSERT_OFFSET(pg, iov)             \
 	static_assert(offsetof(struct page, pg) == \
 		      offsetof(struct net_iov, iov))
-NET_IOV_ASSERT_OFFSET(pp_magic, pp_magic);
-NET_IOV_ASSERT_OFFSET(pp, pp);
-NET_IOV_ASSERT_OFFSET(dma_addr, dma_addr);
-NET_IOV_ASSERT_OFFSET(pp_ref_count, pp_ref_count);
+NET_IOV_ASSERT_OFFSET(netmem_desc, netmem_desc);
 #undef NET_IOV_ASSERT_OFFSET
 
 static inline struct net_iov_area *net_iov_owner(const struct net_iov *niov)
@@ -196,17 +190,17 @@ static inline struct net_iov *__netmem_clear_lsb(netmem_ref netmem)
  */
 static inline struct page_pool *__netmem_get_pp(netmem_ref netmem)
 {
-	return __netmem_to_page(netmem)->pp;
+	return __netmem_to_page(netmem)->netmem_desc.pp;
 }
 
 static inline struct page_pool *netmem_get_pp(netmem_ref netmem)
 {
-	return __netmem_clear_lsb(netmem)->pp;
+	return __netmem_clear_lsb(netmem)->netmem_desc.pp;
 }
 
 static inline atomic_long_t *netmem_get_pp_ref_count_ref(netmem_ref netmem)
 {
-	return &__netmem_clear_lsb(netmem)->pp_ref_count;
+	return &__netmem_clear_lsb(netmem)->netmem_desc.pp_ref_count;
 }
 
 static inline bool netmem_is_pref_nid(netmem_ref netmem, int pref_nid)
@@ -271,7 +265,7 @@ static inline bool netmem_is_pfmemalloc(netmem_ref netmem)
 
 static inline unsigned long netmem_get_dma_addr(netmem_ref netmem)
 {
-	return __netmem_clear_lsb(netmem)->dma_addr;
+	return __netmem_clear_lsb(netmem)->netmem_desc.dma_addr;
 }
 
 void get_netmem(netmem_ref netmem);
