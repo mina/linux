@@ -69,7 +69,7 @@ def test_rxtx(cfg) -> None:
 
     port = rand_port()
 
-    ncdevmem_tx = f"yes $(echo -e \x01\x02\x03\x04\x05\x06) | head -c 10K | {cfg.bin_remote} -s {cfg.addr} -p {port} -f {cfg.ifname} -c {cfg.remote_addr}"
+    ncdevmem_tx = f"yes $(echo -e \x01\x02\x03\x04\x05\x06) | head -c 1M | {cfg.bin_remote} -s {cfg.addr} -p {port} -f {cfg.ifname} -c {cfg.remote_addr}"
     ncdevmem_rx = f"{cfg.bin_remote} -l -s {cfg.addr} -p {port} -f {cfg.ifname} -c {cfg.remote_addr} -v 7"
 
     with bkg(ncdevmem_rx, exit_wait=True) as ncdevmem_rx_proc:
