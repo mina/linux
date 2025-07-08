@@ -565,10 +565,6 @@ static int do_server(struct memory_buffer *mem)
 	if (configure_headersplit(1))
 		error(1, 0, "Failed to enable TCP header split\n");
 
-	/* Configure RSS to divert all traffic from our devmem queues */
-	if (configure_rss())
-		error(1, 0, "Failed to configure rss\n");
-
 	/* Flow steer our devmem flows to start_queue */
 	if (configure_flow_steering(&server_sin))
 		error(1, 0, "Failed to configure flow steering\n");
@@ -728,10 +724,6 @@ void run_devmem_tests(void)
 	struct ynl_sock *ys;
 
 	mem = provider->alloc(getpagesize() * NUM_PAGES);
-
-	/* Configure RSS to divert all traffic from our devmem queues */
-	if (configure_rss())
-		error(1, 0, "rss error\n");
 
 	if (configure_headersplit(1))
 		error(1, 0, "Failed to configure header split\n");
