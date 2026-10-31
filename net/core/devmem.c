@@ -201,13 +201,34 @@ void net_devmem_free_dmabuf(struct net_iov *niov)
 	spin_unlock_bh(&binding->freelist_lock);
 }
 
-void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
+static void
+net_devmem_close_rxqs(struct net_device *bind_dev,
+		      struct net_devmem_dmabuf_binding *binding)
 {
+	const struct pp_memory_provider_params mp_params = {
+		.mp_priv	= binding,
+		.mp_ops		= &dmabuf_devmem_ops,
+	};
 	struct netdev_rx_queue *rxq;
 	unsigned long xa_idx;
 	unsigned int rxq_idx;
 	bool busy = false;
 
+	netdev_assert_locked(bind_dev);
+
+	xa_for_each(&binding->bound_rxqs, xa_idx, rxq) {
+		xa_erase(&binding->bound_rxqs, xa_idx);
+		rxq_idx = get_netdev_rx_queue_index(rxq);
+		if (netif_mp_close_rxq(bind_dev, rxq_idx, &mp_params))
+			busy = true;
+	}
+
+	if (!busy)
+		net_devmem_dmabuf_binding_unmap(binding);
+}
+
+void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
+{
 	xa_clear_mark(&net_devmem_dmabuf_bindings, binding->id,
 		      NET_DEVMEM_BINDING_LIVE);
 
@@ -219,20 +240,8 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 	if (binding->list.next)
 		list_del(&binding->list);
 
-	xa_for_each(&binding->bound_rxqs, xa_idx, rxq) {
-		const struct pp_memory_provider_params mp_params = {
-			.mp_priv	= binding,
-			.mp_ops		= &dmabuf_devmem_ops,
-		};
-
-		rxq_idx = get_netdev_rx_queue_index(rxq);
-
-		if (netif_mp_close_rxq(binding->map_dev, rxq_idx, &mp_params))
-			busy = true;
-	}
-
-	if (binding->direction == DMA_FROM_DEVICE && binding->map_dev && !busy) {
-		net_devmem_dmabuf_binding_unmap(binding);
+	if (binding->direction == DMA_FROM_DEVICE && binding->map_dev) {
+		net_devmem_close_rxqs(binding->map_dev, binding);
 		WRITE_ONCE(binding->map_dev, NULL);
 	}
 
