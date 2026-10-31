@@ -86,17 +86,16 @@ net_devmem_dmabuf_binding_unmap(struct net_devmem_dmabuf_binding *binding)
 
 /**
  * net_devmem_lock_dev() - lock a binding's net_device pointer if still alive
- * @dev_ptr:		pointer to the net_device field to lock
+ * @dev_ptr:		pointer to either &binding->map_dev or &binding->bind_dev
  * @dev_tracker:	reftracker for the held net_device reference
  *
  * Safely dereference @dev_ptr, acquire netdev_lock() on the device, and
  * verify that *@dev_ptr has not been cleared while waiting for the lock.
  *
  * Invariant: *@dev_ptr is set once at bind time and is only ever cleared to
- * NULL while holding netdev_lock(dev) (in mp_dmabuf_devmem_uninstall(),
- * net_devmem_unbind_dmabuf(), or net_devmem_dev_unregister() during
- * NETDEV_UNREGISTER before synchronize_net() and netdev_run_todo() free the
- * net_device).
+ * NULL while holding netdev_lock(dev) (in net_devmem_unbind_dmabuf() for
+ * bind_dev, or net_devmem_dev_unregister() during NETDEV_UNREGISTER before
+ * synchronize_net() and netdev_run_todo() free the net_device).
  *
  * Taking rcu_read_lock() guarantees that a non-NULL @dev read from
  * *@dev_ptr has not yet completed unregister_netdevice_many_notify()
@@ -261,24 +260,23 @@ void net_devmem_dev_unregister(struct net_device *dev)
 
 	xa_lock(&net_devmem_dmabuf_bindings);
 	xa_for_each(&net_devmem_dmabuf_bindings, xa_idx, binding) {
-		if (binding->direction == DMA_FROM_DEVICE) {
-			if (READ_ONCE(binding->map_dev) != dev ||
-			    xa_get_mark(&net_devmem_dmabuf_bindings, xa_idx,
-					NET_DEVMEM_BINDING_LIVE))
-				continue;
-		} else {
-			if (READ_ONCE(binding->bind_dev) == dev)
-				WRITE_ONCE(binding->bind_dev, NULL);
-			if (READ_ONCE(binding->map_dev) != dev)
-				continue;
-			WRITE_ONCE(binding->bind_dev, NULL);
+		if (READ_ONCE(binding->bind_dev) == dev) {
 			__xa_clear_mark(&net_devmem_dmabuf_bindings, xa_idx,
 					NET_DEVMEM_BINDING_LIVE);
+			if (!xa_empty(&binding->bound_rxqs)) {
+				xa_unlock(&net_devmem_dmabuf_bindings);
+				net_devmem_close_rxqs(dev, binding);
+				xa_lock(&net_devmem_dmabuf_bindings);
+			}
+			WRITE_ONCE(binding->bind_dev, NULL);
 		}
+		if (READ_ONCE(binding->map_dev) != dev)
+			continue;
 
+		__xa_clear_mark(&net_devmem_dmabuf_bindings, xa_idx,
+				NET_DEVMEM_BINDING_LIVE);
 		xa_unlock(&net_devmem_dmabuf_bindings);
-		if (!netif_is_queue_leasee(dev))
-			net_devmem_dmabuf_binding_unmap(binding);
+		net_devmem_dmabuf_binding_unmap(binding);
 		xa_lock(&net_devmem_dmabuf_bindings);
 		WRITE_ONCE(binding->map_dev, NULL);
 	}
@@ -332,6 +330,16 @@ net_devmem_bind_dmabuf(struct net_device *map_dev,
 	size_t niov_idx;
 	size_t i;
 	long err;
+
+	netdev_assert_locked(bind_dev);
+	netdev_assert_locked(map_dev);
+
+	if (bind_dev->reg_state != NETREG_REGISTERED ||
+	    map_dev->reg_state != NETREG_REGISTERED ||
+	    !netif_device_present(map_dev)) {
+		NL_SET_ERR_MSG(extack, "Device is being unregistered");
+		return ERR_PTR(-ENODEV);
+	}
 
 	if (!dma_dev) {
 		NL_SET_ERR_MSG(extack, "Device doesn't support DMA");
@@ -686,17 +694,17 @@ static void mp_dmabuf_devmem_uninstall(void *mp_priv,
 	struct netdev_rx_queue *bound_rxq;
 	unsigned long xa_idx;
 
+	rxq->mp_params.mp_ops = NULL;
+	rxq->mp_params.mp_priv = NULL;
+
 	xa_for_each(&binding->bound_rxqs, xa_idx, bound_rxq) {
-		if (bound_rxq != rxq)
+		if (bound_rxq != rxq &&
+		    READ_ONCE(bound_rxq->lease) != rxq)
 			continue;
 
 		xa_erase(&binding->bound_rxqs, xa_idx);
-		if (xa_empty(&binding->bound_rxqs)) {
-			if (!rxq->lease)
-				net_devmem_dmabuf_binding_unmap(binding);
-			ASSERT_EXCLUSIVE_WRITER(binding->map_dev);
-			WRITE_ONCE(binding->map_dev, NULL);
-		}
+		if (xa_empty(&binding->bound_rxqs))
+			net_devmem_dmabuf_binding_unmap(binding);
 		break;
 	}
 }
