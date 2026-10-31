@@ -240,9 +240,10 @@ void net_devmem_unbind_dmabuf(struct net_devmem_dmabuf_binding *binding)
 	if (binding->list.next)
 		list_del(&binding->list);
 
-	if (binding->direction == DMA_FROM_DEVICE && binding->map_dev) {
-		net_devmem_close_rxqs(binding->map_dev, binding);
-		WRITE_ONCE(binding->map_dev, NULL);
+	if (binding->bind_dev) {
+		if (binding->direction == DMA_FROM_DEVICE)
+			net_devmem_close_rxqs(binding->bind_dev, binding);
+		WRITE_ONCE(binding->bind_dev, NULL);
 	}
 
 	percpu_ref_kill(&binding->ref);
@@ -568,8 +569,7 @@ struct net_devmem_dmabuf_binding *net_devmem_get_binding(struct sock *sk,
 	 * net_device.
 	 */
 	dst_dev = dst_dev_rcu(dst);
-	if (unlikely(!dst_dev) ||
-	    unlikely(dst_dev != READ_ONCE(binding->map_dev) &&
+	if (unlikely(!dst_dev || !READ_ONCE(binding->map_dev) ||
 		     dst_dev != READ_ONCE(binding->bind_dev))) {
 		err = -ENODEV;
 		goto out_unlock;
