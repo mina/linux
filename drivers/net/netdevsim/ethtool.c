@@ -78,9 +78,6 @@ static void nsim_get_ringparam(struct net_device *dev,
 
 	memcpy(ring, &ns->ethtool.ring, sizeof(ns->ethtool.ring));
 	kernel_ring->hds_thresh_max = NSIM_HDS_THRESHOLD_MAX;
-
-	if (dev->cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_UNKNOWN)
-		kernel_ring->tcp_data_split = ETHTOOL_TCP_DATA_SPLIT_ENABLED;
 }
 
 static int nsim_set_ringparam(struct net_device *dev,
@@ -126,7 +123,12 @@ static int
 nsim_set_channels(struct net_device *dev, struct ethtool_channels *ch)
 {
 	struct netdevsim *ns = netdev_priv(dev);
+	unsigned int i;
 	int err;
+
+	for (i = ch->combined_count; i < dev->real_num_rx_queues; i++)
+		if (netif_rxq_has_unreadable_mp(dev, i))
+			return -EBUSY;
 
 	err = netif_set_real_num_queues(dev, ch->combined_count,
 					ch->combined_count);
@@ -561,6 +563,7 @@ void nsim_ethtool_init(struct netdevsim *ns)
 
 	ns->ethtool.pauseparam.report_stats_rx = true;
 	ns->ethtool.pauseparam.report_stats_tx = true;
+	ns->ethtool.coalesce.rx_coalesce_usecs = 5;
 
 	ns->ethtool.fec.fec = ETHTOOL_FEC_NONE;
 	ns->ethtool.fec.active_fec = ETHTOOL_FEC_NONE;

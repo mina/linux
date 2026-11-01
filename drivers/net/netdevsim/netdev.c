@@ -100,10 +100,244 @@ static int nsim_napi_rx(struct net_device *tx_dev, struct net_device *rx_dev,
 	return NET_RX_SUCCESS;
 }
 
+static bool nsim_skb_has_net_iov(const struct sk_buff *skb)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int i;
+
+	if (!skb_frags_readable(skb))
+		return true;
+	for (i = 0; i < shinfo->nr_frags; i++) {
+		if (skb_frag_is_net_iov(&shinfo->frags[i]))
+			return true;
+	}
+	return false;
+}
+
+static int nsim_copy_skb_bits(const struct sk_buff *skb, int offset,
+			      void *to, int len)
+{
+	const struct skb_shared_info *shinfo = skb_shinfo(skb);
+	int start = skb_headlen(skb);
+	struct sk_buff *frag_iter;
+	int i, copy;
+
+	if (skb_frags_readable(skb) && !nsim_skb_has_net_iov(skb))
+		return skb_copy_bits(skb, offset, to, len);
+
+	if (offset > (int)skb->len - len)
+		return -EFAULT;
+
+	copy = start - offset;
+	if (copy > 0) {
+		if (copy > len)
+			copy = len;
+		memcpy(to, skb->data + offset, copy);
+		len -= copy;
+		if (!len)
+			return 0;
+		offset += copy;
+		to += copy;
+	}
+
+	for (i = 0; i < shinfo->nr_frags; i++) {
+		const skb_frag_t *frag = &shinfo->frags[i];
+		int end = start + skb_frag_size(frag);
+
+		copy = end - offset;
+		if (copy > 0) {
+			unsigned int f_off = offset - start;
+
+			if (copy > len)
+				copy = len;
+			if (skb_frag_is_net_iov(frag)) {
+				int err;
+
+				err = net_devmem_niov_copy_to_buf(skb_frag_net_iov(frag),
+								  skb_frag_off(frag) + f_off,
+								  to, copy);
+				if (err)
+					return err;
+			} else {
+				memcpy_from_page(to, skb_frag_page(frag),
+						 skb_frag_off(frag) + f_off,
+						 copy);
+			}
+			len -= copy;
+			if (!len)
+				return 0;
+			offset += copy;
+			to += copy;
+		}
+		start = end;
+	}
+
+	skb_walk_frags(skb, frag_iter) {
+		int end = start + frag_iter->len;
+
+		copy = end - offset;
+		if (copy > 0) {
+			int err;
+
+			if (copy > len)
+				copy = len;
+			err = nsim_copy_skb_bits(frag_iter, offset - start,
+						 to, copy);
+			if (err)
+				return err;
+			len -= copy;
+			if (!len)
+				return 0;
+			offset += copy;
+			to += copy;
+		}
+		start = end;
+	}
+
+	return len ? -EFAULT : 0;
+}
+
+static int nsim_copy_skb_to_niov(const struct sk_buff *src_skb,
+				 unsigned int src_off,
+				 struct net_iov *dst_niov,
+				 unsigned int dst_off,
+				 unsigned int len)
+{
+	u8 buf[512];
+
+	while (len > 0) {
+		unsigned int chunk = min_t(unsigned int, len, sizeof(buf));
+		int err;
+
+		err = nsim_copy_skb_bits(src_skb, src_off, buf, chunk);
+		if (err)
+			return err;
+		err = net_devmem_niov_copy_from_buf(dst_niov, dst_off,
+						    buf, chunk);
+		if (err)
+			return err;
+
+		src_off += chunk;
+		dst_off += chunk;
+		len -= chunk;
+	}
+
+	return 0;
+}
+
+static struct sk_buff *nsim_copy_devmem_skb(const struct sk_buff *skb)
+{
+	unsigned int size = skb_end_offset(skb) + skb->data_len;
+	int headerlen = skb_headroom(skb);
+	struct sk_buff *n;
+
+	n = alloc_skb(size, GFP_ATOMIC);
+	if (!n)
+		return NULL;
+
+	skb_reserve(n, headerlen);
+	skb_put(n, skb->len);
+	memcpy(n->head, skb->head, headerlen);
+	if (nsim_copy_skb_bits(skb, 0, n->data, skb->len)) {
+		kfree_skb(n);
+		return NULL;
+	}
+
+	skb_copy_header(n, skb);
+	n->unreadable = 0;
+	return n;
+}
+
+static struct sk_buff *nsim_build_pp_rx_skb(struct net_device *rx_dev,
+					    struct nsim_rq *rq,
+					    const struct sk_buff *skb)
+{
+	unsigned int max_frag = PAGE_SIZE << rq->page_pool->p.order;
+	unsigned int probe_len = min_t(unsigned int, skb->len, 256);
+	bool unreadable = page_pool_is_unreadable(rq->page_pool);
+	unsigned int len = skb->len;
+	unsigned int hdr_len, payload_len;
+	struct sk_buff *rx_skb;
+	u8 hdr_buf[256];
+
+	if (nsim_copy_skb_bits(skb, 0, hdr_buf, probe_len))
+		return NULL;
+
+	hdr_len = eth_get_headlen(rx_dev, hdr_buf, probe_len);
+	if (hdr_len > len)
+		hdr_len = len;
+	payload_len = len - hdr_len;
+
+	if (!payload_len || payload_len <= rx_dev->cfg->hds_thresh) {
+		rx_skb = napi_alloc_skb(&rq->napi, len);
+		if (!rx_skb)
+			return NULL;
+		if (nsim_copy_skb_bits(skb, 0, skb_put(rx_skb, len), len)) {
+			dev_kfree_skb_any(rx_skb);
+			return NULL;
+		}
+		return rx_skb;
+	}
+
+	rx_skb = napi_alloc_skb(&rq->napi, hdr_len);
+	if (!rx_skb)
+		return NULL;
+
+	if (nsim_copy_skb_bits(skb, 0, skb_put(rx_skb, hdr_len), hdr_len))
+		goto err_free_skb;
+
+	skb_mark_for_recycle(rx_skb);
+	rx_skb->unreadable = unreadable;
+
+	for (unsigned int src_off = hdr_len, rem = payload_len, frag_idx = 0;
+	     rem > 0; frag_idx++) {
+		unsigned int alloc_len = max_frag;
+		unsigned int frag_off = 0;
+		unsigned int copy_len;
+		netmem_ref netmem;
+		int err;
+
+		if (frag_idx >= MAX_SKB_FRAGS)
+			goto err_free_skb;
+
+		netmem = page_pool_dev_alloc_netmem(rq->page_pool, &frag_off,
+						    &alloc_len);
+		if (!netmem)
+			goto err_free_skb;
+
+		copy_len = min(rem, alloc_len);
+		if (netmem_is_net_iov(netmem))
+			err = nsim_copy_skb_to_niov(skb, src_off,
+						    netmem_to_net_iov(netmem),
+						    frag_off, copy_len);
+		else
+			err = nsim_copy_skb_bits(skb, src_off,
+						 netmem_address(netmem) + frag_off,
+						 copy_len);
+		if (err) {
+			page_pool_put_full_netmem(rq->page_pool, netmem, true);
+			goto err_free_skb;
+		}
+
+		skb_add_rx_frag_netmem(rx_skb, frag_idx, netmem, frag_off,
+				       copy_len, alloc_len);
+		src_off += copy_len;
+		rem -= copy_len;
+	}
+
+	return rx_skb;
+
+err_free_skb:
+	dev_kfree_skb_any(rx_skb);
+	return NULL;
+}
+
 static int nsim_forward_skb(struct net_device *tx_dev,
 			    struct net_device *rx_dev,
 			    struct sk_buff *skb,
 			    struct nsim_rq *rq,
+			    int rxq,
+			    bool set_csum_unnecessary,
 			    struct skb_ext *psp_ext)
 {
 	int ret;
@@ -115,6 +349,10 @@ static int nsim_forward_skb(struct net_device *tx_dev,
 		return ret;
 	}
 
+	if (set_csum_unnecessary)
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+	skb_record_rx_queue(skb, rxq);
+
 	nsim_psp_handle_ext(skb, psp_ext);
 
 	return nsim_napi_rx(tx_dev, rx_dev, rq, skb);
@@ -122,21 +360,30 @@ static int nsim_forward_skb(struct net_device *tx_dev,
 
 static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+	unsigned int pkts = max_t(unsigned int, 1, skb_shinfo(skb)->gso_segs);
 	struct netdevsim *ns = netdev_priv(dev);
+	bool tx_devmem = nsim_skb_has_net_iov(skb);
 	struct skb_ext *psp_ext = NULL;
 	struct net_device *peer_dev;
 	unsigned int len = skb->len;
 	struct netdevsim *peer_ns;
 	struct netdev_config *cfg;
+	bool rx_devmem, use_pp_rx;
 	struct nsim_rq *rq;
+	unsigned int i;
 	int rxq;
 	int dr;
 
 	rcu_read_lock();
-	if (!skb_frags_readable(skb) ||
-	    (skb_shinfo(skb)->nr_frags &&
-	     skb_frag_is_net_iov(&skb_shinfo(skb)->frags[0])))
-		goto out_drop_any;
+	if (tx_devmem) {
+		struct sk_buff *copy_skb = nsim_copy_devmem_skb(skb);
+
+		if (!copy_skb)
+			goto out_drop_any;
+		skb_tx_timestamp(skb);
+		consume_skb(skb);
+		skb = copy_skb;
+	}
 	if (!nsim_ipsec_tx(ns, skb))
 		goto out_drop_any;
 
@@ -159,24 +406,82 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (rxq < 0)
 		goto out_drop_any;
 	rq = peer_ns->rq[rxq];
+	if (!rq || !rq->page_pool)
+		goto out_drop_any;
+	rx_devmem = page_pool_is_unreadable(rq->page_pool);
+	use_pp_rx = rx_devmem ||
+		    peer_dev->cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_ENABLED;
 
-	cfg = peer_dev->cfg;
-	if (skb_is_nonlinear(skb) &&
-	    (cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED ||
-	     (cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_ENABLED &&
-	      cfg->hds_thresh > len)))
-		skb_linearize(skb);
+	if (!tx_devmem)
+		skb_tx_timestamp(skb);
 
-	skb_tx_timestamp(skb);
-	if (unlikely(nsim_forward_skb(dev, peer_dev,
-				      skb, rq, psp_ext) == NET_RX_DROP))
-		goto out_drop_cnt;
+	if (use_pp_rx) {
+		struct sk_buff *segs, *next;
 
-	if (!hrtimer_active(&rq->napi_timer))
-		hrtimer_start(&rq->napi_timer, us_to_ktime(5), HRTIMER_MODE_REL);
+		if (skb_is_gso(skb)) {
+			segs = skb_gso_segment(skb, 0);
+			if (IS_ERR(segs)) {
+				if (psp_ext)
+					__skb_ext_put(psp_ext);
+				goto out_drop_any;
+			}
+			consume_skb(skb);
+		} else {
+			if (skb->ip_summed == CHECKSUM_PARTIAL &&
+			    skb_checksum_help(skb)) {
+				if (psp_ext)
+					__skb_ext_put(psp_ext);
+				goto out_drop_any;
+			}
+			segs = skb;
+			skb->next = NULL;
+		}
+
+		skb_list_walk_safe(segs, skb, next) {
+			struct sk_buff *rx_skb;
+
+			skb_mark_not_on_list(skb);
+			rx_skb = nsim_build_pp_rx_skb(peer_dev, rq, skb);
+			consume_skb(skb);
+			if (!rx_skb) {
+				if (psp_ext)
+					__skb_ext_put(psp_ext);
+				kfree_skb_list(next);
+				goto out_drop_cnt;
+			}
+
+			if (unlikely(nsim_forward_skb(dev, peer_dev, rx_skb,
+						      rq, rxq, true,
+						      psp_ext) == NET_RX_DROP)) {
+				kfree_skb_list(next);
+				goto out_drop_cnt;
+			}
+			psp_ext = NULL;
+		}
+	} else {
+		cfg = peer_dev->cfg;
+		if (skb_is_nonlinear(skb) &&
+		    (cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED ||
+		     (cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_ENABLED &&
+		      cfg->hds_thresh > len)))
+			skb_linearize(skb);
+
+		if (unlikely(nsim_forward_skb(dev, peer_dev, skb, rq, rxq,
+					      false, psp_ext) == NET_RX_DROP))
+			goto out_drop_cnt;
+	}
+
+	if (!peer_ns->ethtool.coalesce.rx_coalesce_usecs)
+		napi_schedule(&rq->napi);
+	else if (!hrtimer_active(&rq->napi_timer))
+		hrtimer_start(&rq->napi_timer,
+			      us_to_ktime(peer_ns->ethtool.coalesce.rx_coalesce_usecs),
+			      HRTIMER_MODE_REL);
 
 	rcu_read_unlock();
 	dev_dstats_tx_add(dev, len);
+	for (i = 1; i < pkts; i++)
+		dev_dstats_tx_add(dev, 0);
 	return NETDEV_TX_OK;
 
 out_drop_any:
@@ -400,13 +705,18 @@ static int nsim_rcv(struct nsim_rq *rq, int budget)
 				skb_checksum_help(skb);
 			ret = do_xdp_generic(xdp_prog, &skb);
 			if (ret != XDP_PASS) {
+				WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
+				WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skblen);
 				dev_dstats_rx_add(dev, skblen);
 				continue;
 			}
 		}
 
 		/* skb might be discard at netif_receive_skb, save the len */
-		dev_dstats_rx_add(dev, skb->len);
+		skblen = skb->len;
+		WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
+		WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skblen);
+		dev_dstats_rx_add(dev, skblen);
 		napi_gro_receive(&rq->napi, skb);
 	}
 
@@ -427,14 +737,14 @@ static int nsim_poll(struct napi_struct *napi, int budget)
 }
 
 static int nsim_create_page_pool(struct net_device *dev, struct page_pool **p,
-				 struct napi_struct *napi, int idx)
+				 struct napi_struct *napi, int idx,
+				 unsigned int order)
 {
 	struct netdevsim *ns = netdev_priv(dev);
 	struct page_pool_params params = {
-		.order = 0,
+		.order = order,
 		.pool_size = NSIM_RING_SIZE,
-		.flags = PP_FLAG_ALLOW_UNREADABLE_NETMEM,
-		.max_len = PAGE_SIZE,
+		.max_len = PAGE_SIZE << order,
 		.nid = NUMA_NO_NODE,
 		.dev = &ns->nsim_bus_dev->dev,
 		.napi = napi,
@@ -444,6 +754,8 @@ static int nsim_create_page_pool(struct net_device *dev, struct page_pool **p,
 	};
 	struct page_pool *pool;
 
+	if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_DISABLED)
+		params.flags |= PP_FLAG_ALLOW_UNREADABLE_NETMEM;
 	if (ns->nsim_bus_dev->dev.dma_mask && PP_DMA_INDEX_BITS)
 		params.flags |= PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
 
@@ -470,7 +782,8 @@ static int nsim_init_napi(struct netdevsim *ns)
 	for (i = 0; i < dev->num_rx_queues; i++) {
 		rq = ns->rq[i];
 
-		err = nsim_create_page_pool(dev, &rq->page_pool, &rq->napi, i);
+		err = nsim_create_page_pool(dev, &rq->page_pool, &rq->napi,
+					    i, 0);
 		if (err)
 			goto err_pp_destroy;
 	}
@@ -688,13 +1001,11 @@ static const struct net_device_ops nsim_vf_netdev_ops = {
 static void nsim_get_queue_stats_rx(struct net_device *dev, int idx,
 				    struct netdev_queue_stats_rx *stats)
 {
-	struct rtnl_link_stats64 rtstats = {};
+	struct netdevsim *ns = netdev_priv(dev);
+	struct nsim_rq *rq = ns->rq[idx];
 
-	if (!idx)
-		dev_get_stats(dev, &rtstats);
-
-	stats->packets = rtstats.rx_packets - !!rtstats.rx_packets;
-	stats->bytes = rtstats.rx_bytes;
+	stats->packets = READ_ONCE(rq->rx_packets);
+	stats->bytes = READ_ONCE(rq->rx_bytes);
 }
 
 static void nsim_get_queue_stats_tx(struct net_device *dev, int idx,
@@ -713,12 +1024,21 @@ static void nsim_get_base_stats(struct net_device *dev,
 				struct netdev_queue_stats_rx *rx,
 				struct netdev_queue_stats_tx *tx)
 {
+	struct netdevsim *ns = netdev_priv(dev);
 	struct rtnl_link_stats64 rtstats = {};
+	u64 q_rx_packets = 0, q_rx_bytes = 0;
+	int i;
 
 	dev_get_stats(dev, &rtstats);
+	for (i = 0; i < dev->real_num_rx_queues; i++) {
+		q_rx_packets += READ_ONCE(ns->rq[i]->rx_packets);
+		q_rx_bytes += READ_ONCE(ns->rq[i]->rx_bytes);
+	}
 
-	rx->packets = !!rtstats.rx_packets;
-	rx->bytes = 0;
+	rx->packets = rtstats.rx_packets >= q_rx_packets ?
+		      rtstats.rx_packets - q_rx_packets : 0;
+	rx->bytes = rtstats.rx_bytes >= q_rx_bytes ?
+		    rtstats.rx_bytes - q_rx_bytes : 0;
 	tx->packets = !!rtstats.tx_packets;
 	tx->bytes = 0;
 }
@@ -772,6 +1092,8 @@ nsim_queue_mem_alloc(struct net_device *dev,
 		     struct netdev_queue_config *qcfg,
 		     void *per_queue_mem, int idx)
 {
+	unsigned int order = qcfg->rx_page_size ?
+			     get_order(qcfg->rx_page_size) : 0;
 	struct nsim_queue_mem *qmem = per_queue_mem;
 	struct netdevsim *ns = netdev_priv(dev);
 	int err;
@@ -779,11 +1101,15 @@ nsim_queue_mem_alloc(struct net_device *dev,
 	if (ns->rq_reset_mode > 3)
 		return -EINVAL;
 
+	if (netif_rxq_has_unreadable_mp(dev, idx) &&
+	    dev->cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_DISABLED)
+		return -EINVAL;
+
 	if (ns->rq_reset_mode == 1) {
 		if (!netif_running(ns->netdev))
 			return -ENETDOWN;
 		return nsim_create_page_pool(dev, &qmem->pp,
-					     &ns->rq[idx]->napi, idx);
+					     &ns->rq[idx]->napi, idx, order);
 	}
 
 	qmem->rq = nsim_queue_alloc();
@@ -791,7 +1117,7 @@ nsim_queue_mem_alloc(struct net_device *dev,
 		return -ENOMEM;
 
 	err = nsim_create_page_pool(dev, &qmem->rq->page_pool, &qmem->rq->napi,
-				    idx);
+				    idx, order);
 	if (err)
 		goto err_free;
 
@@ -813,10 +1139,12 @@ static void nsim_queue_mem_free(struct net_device *dev, void *per_queue_mem)
 
 	page_pool_destroy(qmem->pp);
 	if (qmem->rq) {
+		struct page_pool *pp = qmem->rq->page_pool;
+
 		if (!ns->rq_reset_mode)
 			netif_napi_del_locked(&qmem->rq->napi);
-		page_pool_destroy(qmem->rq->page_pool);
 		nsim_queue_free(dev, qmem->rq);
+		page_pool_destroy(pp);
 	}
 }
 
@@ -848,6 +1176,8 @@ nsim_queue_start(struct net_device *dev, struct netdev_queue_config *qcfg,
 		netif_napi_del_locked(&ns->rq[idx]->napi);
 	}
 
+	qmem->rq->rx_packets = ns->rq[idx]->rx_packets;
+	qmem->rq->rx_bytes = ns->rq[idx]->rx_bytes;
 	ns->rq[idx] = qmem->rq;
 	netif_queue_set_napi(dev, idx, NETDEV_QUEUE_TYPE_RX, &ns->rq[idx]->napi);
 	napi_enable_locked(&ns->rq[idx]->napi);
@@ -875,6 +1205,7 @@ static int nsim_queue_stop(struct net_device *dev, void *per_queue_mem, int idx)
 }
 
 static const struct netdev_queue_mgmt_ops nsim_queue_mgmt_ops = {
+	.supported_params	= QCFG_RX_PAGE_SIZE,
 	.ndo_queue_mem_size	= sizeof(struct nsim_queue_mem),
 	.ndo_queue_mem_alloc	= nsim_queue_mem_alloc,
 	.ndo_queue_mem_free	= nsim_queue_mem_free,
@@ -1010,8 +1341,13 @@ static void nsim_setup(struct net_device *dev)
 			 NETIF_F_SG |
 			 NETIF_F_FRAGLIST |
 			 NETIF_F_HW_CSUM |
+			 NETIF_F_RXCSUM |
+			 NETIF_F_RXHASH |
 			 NETIF_F_LRO |
 			 NETIF_F_TSO |
+			 NETIF_F_TSO6 |
+			 NETIF_F_GSO_UDP_L4 |
+			 NETIF_F_GRO_FRAGLIST |
 			 NETIF_F_NTUPLE |
 			 NETIF_F_HW_VLAN_CTAG_FILTER |
 			 NETIF_F_HW_VLAN_STAG_FILTER;
@@ -1019,8 +1355,13 @@ static void nsim_setup(struct net_device *dev)
 			    NETIF_F_SG |
 			    NETIF_F_FRAGLIST |
 			    NETIF_F_HW_CSUM |
+			    NETIF_F_RXCSUM |
+			    NETIF_F_RXHASH |
 			    NETIF_F_LRO |
 			    NETIF_F_TSO |
+			    NETIF_F_TSO6 |
+			    NETIF_F_GSO_UDP_L4 |
+			    NETIF_F_GRO_FRAGLIST |
 			    NETIF_F_LOOPBACK |
 			    NETIF_F_NTUPLE |
 			    NETIF_F_HW_VLAN_CTAG_FILTER |
@@ -1080,6 +1421,7 @@ static int nsim_init_netdevsim(struct netdevsim *ns)
 	ns->netdev->netdev_ops = &nsim_netdev_ops;
 	ns->netdev->stat_ops = &nsim_stat_ops;
 	ns->netdev->queue_mgmt_ops = &nsim_queue_mgmt_ops;
+	ns->netdev->max_mtu = ETH_MAX_MTU;
 	if (ns->nsim_bus_dev->dev.dma_mask)
 		ns->netdev->netmem_tx = NETMEM_TX_DMA;
 	netdev_lockdep_set_classes(ns->netdev);
