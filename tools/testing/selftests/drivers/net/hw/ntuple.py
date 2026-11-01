@@ -154,7 +154,7 @@ def queue(cfg, ipver, proto, fields):
 def main() -> None:
     """Ksft boilerplate main."""
 
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__, queue_count=4) as cfg:
         cfg.ethnl = EthtoolFamily()
         cfg.netdevnl = NetdevFamily()
         ksft_run([queue], args=(cfg,))

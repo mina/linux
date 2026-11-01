@@ -269,6 +269,32 @@ def run_tx_chunks(cfg):
     ksft_eq(socat.stdout.strip(), "hello\nworld")
 
 
+def run_tx_rx(cfg):
+    """Run end-to-end devmem TX into devmem RX."""
+    require_devmem(cfg)
+    probe_remote = cmd(f"{cfg.bin_remote} -f {cfg.remote_ifname}",
+                       host=cfg.remote, fail=False, shell=True)
+    if probe_remote.ret != 0:
+        raise KsftSkipEx("Test requires devmem support on remote interface")
+
+    configure_nic(cfg)
+    netns = getattr(cfg, "netns", None)
+    port = rand_port()
+    listen_cmd = ncdevmem_rx(cfg, port, verify=True, fail_on_linear=True,
+                             flow_steer=not hasattr(cfg, 'netns'))
+    dst_addr = cfg.nk_guest_ipv6 if hasattr(cfg, 'netns') else cfg.addr
+    client_ip = "" if hasattr(cfg, 'netns') else f"-c {cfg.remote_addr} "
+    tx_cmd = (f"{cfg.bin_remote} -f {cfg.remote_ifname} "
+              f"{client_ip}-s {dst_addr} -p {port}")
+    data_pipe = (f"yes $(echo -e \x01\x02\x03\x04\x05\x06) | head -c 1K"
+                 f" | {tx_cmd}")
+
+    with bkg(listen_cmd, exit_wait=True, ns=netns) as ncdevmem:
+        wait_port_listen(port, proto="tcp", ns=netns)
+        cmd(data_pipe, host=cfg.remote, shell=True)
+    ksft_eq(ncdevmem.ret, 0)
+
+
 def run_rx_large_niov(cfg):
     """Run the devmem RX test with a large niov (rx-page-size > PAGE_SIZE).
 

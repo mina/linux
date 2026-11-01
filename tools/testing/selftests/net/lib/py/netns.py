@@ -57,8 +57,7 @@ class UserNetNS:
         Path(self.net_ns_path).touch()
 
         with subprocess.Popen(
-                ["unshare", "--user", "--net", "--map-root-user",
-                 "sleep", "infinity"]) as proc:
+                ["unshare", "--user", "--net", "sleep", "infinity"]) as proc:
             try:
                 pid = proc.pid
                 init_user = os.readlink("/proc/self/ns/user")
@@ -71,6 +70,11 @@ class UserNetNS:
                     time.sleep(0.01)
                 else:
                     raise RuntimeError("unshare child did not create userns")
+
+                Path(f"/proc/{pid}/uid_map").write_text("0 0 4294967295\n",
+                                                        encoding="utf-8")
+                Path(f"/proc/{pid}/gid_map").write_text("0 0 4294967295\n",
+                                                        encoding="utf-8")
 
                 subprocess.run(["mount", "--bind", f"/proc/{pid}/ns/user",
                                 self.user_ns_path], check=True)

@@ -410,10 +410,13 @@ class NetDrvContEnv(NetDrvEpEnv):
         self._old_fwd = None
         self._old_accept_ra = None
 
+        kwargs.setdefault("queue_count", max(rxqueues, 2))
         super().__init__(src_path, **kwargs)
 
         self.require_ipver("6")
         local_prefix = self.env.get("LOCAL_PREFIX_V6")
+        if not local_prefix and self._ns:
+            local_prefix = "2001:db8:2::/64"
         if not local_prefix:
             raise KsftSkipEx("LOCAL_PREFIX_V6 required")
 
@@ -539,6 +542,10 @@ class NetDrvContEnv(NetDrvEpEnv):
         ip(f"-6 addr add {self.nk_guest_ipv6}/64 dev {self.nk_guest_ifname} nodad", ns=self.netns)
         ip(f"-6 route add default via fe80::1 dev {self.nk_guest_ifname}", ns=self.netns)
 
+        ip(f"-6 route add {self.nk_guest_ipv6}/128 via {self.addr_v['6']}",
+           host=self.remote)
+        self._remote_route_added = True
+
     def _tc_ensure_clsact(self, ifname=None):
         """Ensure a clsact qdisc exists on @ifname.
 
@@ -618,10 +625,6 @@ class NetDrvContEnv(NetDrvEpEnv):
         cmd(f"tc filter add dev {self.nk_host_ifname} ingress"
             f" bpf obj {bpf_obj} sec tc/ingress direct-action")
         self._primary_rx_redirect_attached = True
-
-        ip(f"-6 route add {self.nk_guest_ipv6}/128 via {self.addr_v['6']}",
-           host=self.remote)
-        self._remote_route_added = True
 
         filters = json.loads(
             cmd(f"tc -j filter show dev {self.nk_host_ifname} ingress").stdout)
