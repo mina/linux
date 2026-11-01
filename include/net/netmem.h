@@ -126,6 +126,26 @@ static inline void net_iov_init(struct net_iov *niov,
 	niov->type = type;
 }
 
+#if defined(CONFIG_NET_DEVMEM)
+int net_devmem_niov_copy_to_buf(const struct net_iov *niov, size_t off,
+				void *dst, size_t len);
+int net_devmem_niov_copy_from_buf(struct net_iov *niov, size_t off,
+				  const void *src, size_t len);
+#else
+static inline int net_devmem_niov_copy_to_buf(const struct net_iov *niov,
+					      size_t off, void *dst, size_t len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int net_devmem_niov_copy_from_buf(struct net_iov *niov,
+						size_t off, const void *src,
+						size_t len)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 /* netmem */
 
 /**

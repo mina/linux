@@ -10,6 +10,7 @@
 #ifndef _NET_DEVMEM_H
 #define _NET_DEVMEM_H
 
+#include <linux/iosys-map.h>
 #include <net/net_namespace.h>
 #include <net/netmem.h>
 #include <net/netdev_netlink.h>
@@ -21,6 +22,7 @@ struct net_devmem_dmabuf_binding {
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *attachment;
 	struct sg_table *sgt;
+	struct iosys_map vmap;
 	/* Physical NIC that does the actual DMA for this binding. Set at bind
 	 * time and cleared to NULL under netdev_lock(dev).
 	 */

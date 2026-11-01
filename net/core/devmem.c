@@ -162,6 +162,8 @@ void __net_devmem_dmabuf_binding_free(struct work_struct *wq)
 	xa_erase(&net_devmem_dmabuf_bindings, binding->id);
 	net_devmem_unlock_dev(dev, &dev_tracker);
 
+	if (!iosys_map_is_null(&binding->vmap))
+		dma_buf_vunmap_unlocked(binding->dmabuf, &binding->vmap);
 	dma_buf_put(binding->dmabuf);
 	xa_destroy(&binding->bound_rxqs);
 	percpu_ref_exit(&binding->ref);
@@ -378,6 +380,8 @@ net_devmem_bind_dmabuf(struct net_device *dev, void *vdev,
 		NL_SET_ERR_MSG(extack, "Failed to map dmabuf attachment");
 		goto err_unpin;
 	}
+	if (dma_buf_vmap(dmabuf, &binding->vmap))
+		iosys_map_clear(&binding->vmap);
 	dma_resv_unlock(dmabuf->resv);
 
 	err = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL, true,
@@ -481,6 +485,8 @@ err_free_freelist:
 	kvfree(binding->tx_vec);
 err_unmap:
 	dma_resv_lock(dmabuf->resv, NULL);
+	if (!iosys_map_is_null(&binding->vmap))
+		dma_buf_vunmap(dmabuf, &binding->vmap);
 	dma_buf_unmap_attachment(binding->attachment, binding->sgt, direction);
 err_unpin:
 	dma_buf_unpin(binding->attachment);
@@ -495,6 +501,38 @@ err_put_dmabuf:
 	dma_buf_put(dmabuf);
 	return ERR_PTR(err);
 }
+
+int net_devmem_niov_copy_to_buf(const struct net_iov *niov, size_t off,
+				void *dst, size_t len)
+{
+	struct net_devmem_dmabuf_binding *binding = net_devmem_iov_binding(niov);
+	size_t dmabuf_off = net_iov_virtual_addr(niov) + off;
+
+	if (iosys_map_is_null(&binding->vmap))
+		return -EOPNOTSUPP;
+	if (dmabuf_off + len > binding->dmabuf->size)
+		return -EINVAL;
+
+	iosys_map_memcpy_from(dst, &binding->vmap, dmabuf_off, len);
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(net_devmem_niov_copy_to_buf, "NETDEV_INTERNAL");
+
+int net_devmem_niov_copy_from_buf(struct net_iov *niov, size_t off,
+				  const void *src, size_t len)
+{
+	struct net_devmem_dmabuf_binding *binding = net_devmem_iov_binding(niov);
+	size_t dmabuf_off = net_iov_virtual_addr(niov) + off;
+
+	if (iosys_map_is_null(&binding->vmap))
+		return -EOPNOTSUPP;
+	if (dmabuf_off + len > binding->dmabuf->size)
+		return -EINVAL;
+
+	iosys_map_memcpy_to(&binding->vmap, dmabuf_off, src, len);
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(net_devmem_niov_copy_from_buf, "NETDEV_INTERNAL");
 
 struct net_devmem_dmabuf_binding *net_devmem_lookup_dmabuf(u32 id)
 {
