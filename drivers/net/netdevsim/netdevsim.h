@@ -88,12 +88,21 @@ struct nsim_ethtool_pauseparam {
 };
 
 #define NSIM_RSS_INDIR_SIZE		128
+#define NSIM_MAX_NTUPLE_RULES		16
+
+struct nsim_ntuple_rule {
+	struct ethtool_rx_flow_spec fs;
+	bool used;
+};
 
 struct nsim_ethtool {
 	u32 get_err;
 	u32 set_err;
 	u32 channels;
 	u8 rss_key[NETDEV_RSS_KEY_LEN];
+	u32 rss_indir[NSIM_RSS_INDIR_SIZE];
+	bool rss_indir_configured;
+	struct nsim_ntuple_rule ntuple_rules[NSIM_MAX_NTUPLE_RULES];
 	struct nsim_ethtool_pauseparam pauseparam;
 	struct ethtool_coalesce coalesce;
 	struct ethtool_ringparam ring;
@@ -105,6 +114,8 @@ struct nsim_rq {
 	struct sk_buff_head skb_queue;
 	struct page_pool *page_pool;
 	struct hrtimer napi_timer;
+	u64 rx_packets;
+	u64 rx_bytes;
 };
 
 struct netdevsim {
@@ -173,6 +184,7 @@ bool netdev_is_nsim(struct net_device *dev);
 
 void nsim_ethtool_init(struct netdevsim *ns);
 void nsim_ethtool_fini(struct netdevsim *ns);
+int nsim_select_rxq(struct netdevsim *ns, struct sk_buff *skb);
 
 void nsim_udp_tunnels_debugfs_create(struct nsim_dev *nsim_dev);
 int nsim_udp_tunnels_info_create(struct nsim_dev *nsim_dev,

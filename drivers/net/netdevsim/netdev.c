@@ -155,9 +155,9 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (dr)
 		goto out_drop_free;
 
-	rxq = skb_get_queue_mapping(skb);
-	if (rxq >= peer_dev->num_rx_queues)
-		rxq = rxq % peer_dev->num_rx_queues;
+	rxq = nsim_select_rxq(peer_ns, skb);
+	if (rxq < 0)
+		goto out_drop_any;
 	rq = peer_ns->rq[rxq];
 
 	cfg = peer_dev->cfg;
@@ -1012,6 +1012,7 @@ static void nsim_setup(struct net_device *dev)
 			 NETIF_F_HW_CSUM |
 			 NETIF_F_LRO |
 			 NETIF_F_TSO |
+			 NETIF_F_NTUPLE |
 			 NETIF_F_HW_VLAN_CTAG_FILTER |
 			 NETIF_F_HW_VLAN_STAG_FILTER;
 	dev->hw_features |= NETIF_F_HW_TC |
@@ -1021,6 +1022,7 @@ static void nsim_setup(struct net_device *dev)
 			    NETIF_F_LRO |
 			    NETIF_F_TSO |
 			    NETIF_F_LOOPBACK |
+			    NETIF_F_NTUPLE |
 			    NETIF_F_HW_VLAN_CTAG_FILTER |
 			    NETIF_F_HW_VLAN_STAG_FILTER;
 	dev->pcpu_stat_type = NETDEV_PCPU_STAT_DSTATS;

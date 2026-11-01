@@ -2,7 +2,12 @@
 // Copyright (c) 2020 Facebook
 
 #include <linux/debugfs.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/random.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <net/ipv6.h>
 #include <net/netdev_queues.h>
 
 #include "netdevsim.h"
@@ -129,6 +134,13 @@ nsim_set_channels(struct net_device *dev, struct ethtool_channels *ch)
 		return err;
 
 	ns->ethtool.channels = ch->combined_count;
+	if (!ns->ethtool.rss_indir_configured) {
+		u32 i;
+
+		for (i = 0; i < NSIM_RSS_INDIR_SIZE; i++)
+			ns->ethtool.rss_indir[i] =
+				ethtool_rxfh_indir_default(i, ch->combined_count);
+	}
 
 	/* Only wake up queues if devices are linked */
 	if (rcu_access_pointer(ns->peer))
@@ -219,18 +231,266 @@ static int nsim_get_rxfh(struct net_device *dev,
 			 struct ethtool_rxfh_param *rxfh)
 {
 	struct netdevsim *ns = netdev_priv(dev);
-	u32 i;
 
 	rxfh->hfunc = ETH_RSS_HASH_TOP;
-	if (rxfh->indir) {
-		for (i = 0; i < NSIM_RSS_INDIR_SIZE; i++)
-			rxfh->indir[i] = ethtool_rxfh_indir_default(i, ns->ethtool.channels);
-	}
+	if (rxfh->indir)
+		memcpy(rxfh->indir, ns->ethtool.rss_indir,
+		       sizeof(ns->ethtool.rss_indir));
 	if (rxfh->key)
 		memcpy(rxfh->key, ns->ethtool.rss_key,
 		       sizeof(ns->ethtool.rss_key));
 
 	return 0;
+}
+
+static int nsim_set_rxfh(struct net_device *dev,
+			 struct ethtool_rxfh_param *rxfh,
+			 struct netlink_ext_ack *extack)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	u32 i;
+
+	if (rxfh->hfunc != ETH_RSS_HASH_NO_CHANGE &&
+	    rxfh->hfunc != ETH_RSS_HASH_TOP)
+		return -EOPNOTSUPP;
+
+	if (rxfh->indir) {
+		for (i = 0; i < NSIM_RSS_INDIR_SIZE; i++) {
+			if (rxfh->indir[i] >= dev->num_rx_queues)
+				return -EINVAL;
+		}
+		memcpy(ns->ethtool.rss_indir, rxfh->indir,
+		       sizeof(ns->ethtool.rss_indir));
+		ns->ethtool.rss_indir_configured = true;
+	}
+
+	if (rxfh->key)
+		memcpy(ns->ethtool.rss_key, rxfh->key,
+		       sizeof(ns->ethtool.rss_key));
+
+	return 0;
+}
+
+static u32 nsim_get_rx_ring_count(struct net_device *dev)
+{
+	return dev->num_rx_queues;
+}
+
+static int nsim_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
+			  u32 *rule_locs)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	u32 i, cnt = 0;
+
+	switch (cmd->cmd) {
+	case ETHTOOL_GRXCLSRLCNT:
+		for (i = 0; i < NSIM_MAX_NTUPLE_RULES; i++) {
+			if (ns->ethtool.ntuple_rules[i].used)
+				cnt++;
+		}
+		cmd->rule_cnt = cnt;
+		cmd->data = NSIM_MAX_NTUPLE_RULES | RX_CLS_LOC_SPECIAL;
+		return 0;
+	case ETHTOOL_GRXCLSRULE:
+		if (cmd->fs.location >= NSIM_MAX_NTUPLE_RULES ||
+		    !ns->ethtool.ntuple_rules[cmd->fs.location].used)
+			return -ENOENT;
+		cmd->fs = ns->ethtool.ntuple_rules[cmd->fs.location].fs;
+		return 0;
+	case ETHTOOL_GRXCLSRLALL:
+		for (i = 0; i < NSIM_MAX_NTUPLE_RULES; i++) {
+			if (!ns->ethtool.ntuple_rules[i].used)
+				continue;
+			if (cnt >= cmd->rule_cnt)
+				return -EMSGSIZE;
+			rule_locs[cnt++] = i;
+		}
+		cmd->rule_cnt = cnt;
+		cmd->data = NSIM_MAX_NTUPLE_RULES;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int nsim_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	struct ethtool_rx_flow_spec *fs = &cmd->fs;
+	u32 loc;
+
+	switch (cmd->cmd) {
+	case ETHTOOL_SRXCLSRLINS:
+		if (fs->ring_cookie != RX_CLS_FLOW_DISC &&
+		    ethtool_get_flow_spec_ring(fs->ring_cookie) >=
+		    dev->num_rx_queues)
+			return -EINVAL;
+
+		if (fs->location == RX_CLS_LOC_ANY ||
+		    fs->location == RX_CLS_LOC_FIRST ||
+		    fs->location == RX_CLS_LOC_LAST) {
+			for (loc = 0; loc < NSIM_MAX_NTUPLE_RULES; loc++) {
+				if (!ns->ethtool.ntuple_rules[loc].used)
+					break;
+			}
+			if (loc == NSIM_MAX_NTUPLE_RULES)
+				return -ENOSPC;
+			fs->location = loc;
+		} else {
+			loc = fs->location;
+			if (loc >= NSIM_MAX_NTUPLE_RULES)
+				return -EINVAL;
+		}
+
+		ns->ethtool.ntuple_rules[loc].fs = *fs;
+		ns->ethtool.ntuple_rules[loc].used = true;
+		return 0;
+	case ETHTOOL_SRXCLSRLDEL:
+		if (fs->location >= NSIM_MAX_NTUPLE_RULES ||
+		    !ns->ethtool.ntuple_rules[fs->location].used)
+			return -ENOENT;
+		ns->ethtool.ntuple_rules[fs->location].used = false;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static bool nsim_ntuple_match(const struct ethtool_rx_flow_spec *fs,
+			      struct sk_buff *skb)
+{
+	u32 flow_type = fs->flow_type & ~(FLOW_EXT | FLOW_MAC_EXT | FLOW_RSS);
+	__be16 proto = skb->protocol;
+	unsigned int off = ETH_HLEN;
+
+	if (eth_type_vlan(proto)) {
+		struct vlan_hdr vhdr, *vp;
+
+		vp = skb_header_pointer(skb, off, sizeof(vhdr), &vhdr);
+		if (!vp)
+			return false;
+		proto = vp->h_vlan_encapsulated_proto;
+		off += sizeof(vhdr);
+	}
+
+	if (proto == htons(ETH_P_IP)) {
+		struct iphdr iph_buf, *iph;
+		__be16 ports[2], *pptr;
+
+		iph = skb_header_pointer(skb, off, sizeof(iph_buf), &iph_buf);
+		if (!iph)
+			return false;
+
+		if (flow_type == TCP_V4_FLOW && iph->protocol != IPPROTO_TCP)
+			return false;
+		if (flow_type == UDP_V4_FLOW && iph->protocol != IPPROTO_UDP)
+			return false;
+		if (flow_type != TCP_V4_FLOW && flow_type != UDP_V4_FLOW)
+			return false;
+
+		if ((iph->saddr & fs->m_u.tcp_ip4_spec.ip4src) !=
+		    (fs->h_u.tcp_ip4_spec.ip4src & fs->m_u.tcp_ip4_spec.ip4src))
+			return false;
+		if ((iph->daddr & fs->m_u.tcp_ip4_spec.ip4dst) !=
+		    (fs->h_u.tcp_ip4_spec.ip4dst & fs->m_u.tcp_ip4_spec.ip4dst))
+			return false;
+
+		pptr = skb_header_pointer(skb, off + iph->ihl * 4,
+					  sizeof(ports), ports);
+		if (!pptr)
+			return false;
+		if ((pptr[0] & fs->m_u.tcp_ip4_spec.psrc) !=
+		    (fs->h_u.tcp_ip4_spec.psrc & fs->m_u.tcp_ip4_spec.psrc))
+			return false;
+		if ((pptr[1] & fs->m_u.tcp_ip4_spec.pdst) !=
+		    (fs->h_u.tcp_ip4_spec.pdst & fs->m_u.tcp_ip4_spec.pdst))
+			return false;
+
+		return true;
+	}
+
+	if (proto == htons(ETH_P_IPV6)) {
+		struct ipv6hdr ip6h_buf, *ip6h;
+		__be16 ports[2], *pptr;
+		__be16 frag_off;
+		u8 nexthdr;
+		int l4_off;
+		int i;
+
+		ip6h = skb_header_pointer(skb, off, sizeof(ip6h_buf),
+					  &ip6h_buf);
+		if (!ip6h)
+			return false;
+
+		nexthdr = ip6h->nexthdr;
+		l4_off = ipv6_skip_exthdr(skb, off + sizeof(*ip6h),
+					  &nexthdr, &frag_off);
+		if (l4_off < 0)
+			return false;
+
+		if (flow_type == TCP_V6_FLOW && nexthdr != IPPROTO_TCP)
+			return false;
+		if (flow_type == UDP_V6_FLOW && nexthdr != IPPROTO_UDP)
+			return false;
+		if (flow_type != TCP_V6_FLOW && flow_type != UDP_V6_FLOW)
+			return false;
+
+		for (i = 0; i < 4; i++) {
+			if ((ip6h->saddr.s6_addr32[i] &
+			     fs->m_u.tcp_ip6_spec.ip6src[i]) !=
+			    (fs->h_u.tcp_ip6_spec.ip6src[i] &
+			     fs->m_u.tcp_ip6_spec.ip6src[i]))
+				return false;
+			if ((ip6h->daddr.s6_addr32[i] &
+			     fs->m_u.tcp_ip6_spec.ip6dst[i]) !=
+			    (fs->h_u.tcp_ip6_spec.ip6dst[i] &
+			     fs->m_u.tcp_ip6_spec.ip6dst[i]))
+				return false;
+		}
+
+		pptr = skb_header_pointer(skb, l4_off, sizeof(ports), ports);
+		if (!pptr)
+			return false;
+		if ((pptr[0] & fs->m_u.tcp_ip6_spec.psrc) !=
+		    (fs->h_u.tcp_ip6_spec.psrc & fs->m_u.tcp_ip6_spec.psrc))
+			return false;
+		if ((pptr[1] & fs->m_u.tcp_ip6_spec.pdst) !=
+		    (fs->h_u.tcp_ip6_spec.pdst & fs->m_u.tcp_ip6_spec.pdst))
+			return false;
+
+		return true;
+	}
+
+	return false;
+}
+
+int nsim_select_rxq(struct netdevsim *ns, struct sk_buff *skb)
+{
+	struct net_device *dev = ns->netdev;
+	int i;
+
+	for (i = 0; i < NSIM_MAX_NTUPLE_RULES; i++) {
+		if (!ns->ethtool.ntuple_rules[i].used)
+			continue;
+		if (nsim_ntuple_match(&ns->ethtool.ntuple_rules[i].fs, skb)) {
+			u64 cookie = ns->ethtool.ntuple_rules[i].fs.ring_cookie;
+
+			if (cookie == RX_CLS_FLOW_DISC)
+				return -1;
+			return ethtool_get_flow_spec_ring(cookie) %
+			       dev->num_rx_queues;
+		}
+	}
+
+	if (ns->ethtool.rss_indir_configured) {
+		u32 hash = skb_frags_readable(skb) ?
+			   skb_get_hash(skb) : skb_get_queue_mapping(skb);
+
+		return ns->ethtool.rss_indir[hash % NSIM_RSS_INDIR_SIZE] %
+		       dev->num_rx_queues;
+	}
+
+	return skb_get_queue_mapping(skb) % dev->num_rx_queues;
 }
 
 static int nsim_get_rxfh_fields(struct net_device *dev,
@@ -254,9 +514,13 @@ static int nsim_get_rxfh_fields(struct net_device *dev,
 }
 
 static const struct ethtool_ops nsim_ethtool_ops = {
+	.get_rx_ring_count		= nsim_get_rx_ring_count,
+	.get_rxnfc			= nsim_get_rxnfc,
+	.set_rxnfc			= nsim_set_rxnfc,
 	.get_rxfh_key_size		= nsim_get_rxfh_key_size,
 	.get_rxfh_indir_size		= nsim_get_rxfh_indir_size,
 	.get_rxfh			= nsim_get_rxfh,
+	.set_rxfh			= nsim_set_rxfh,
 	.get_rxfh_fields		= nsim_get_rxfh_fields,
 	.supported_coalesce_params	= ETHTOOL_COALESCE_ALL_PARAMS,
 	.supported_ring_params		= ETHTOOL_RING_USE_TCP_DATA_SPLIT |
@@ -303,6 +567,9 @@ void nsim_ethtool_init(struct netdevsim *ns)
 
 	ns->ethtool.channels = ns->nsim_bus_dev->num_queues;
 	netdev_rss_key_fill(ns->ethtool.rss_key, sizeof(ns->ethtool.rss_key));
+	for (u32 i = 0; i < NSIM_RSS_INDIR_SIZE; i++)
+		ns->ethtool.rss_indir[i] =
+			ethtool_rxfh_indir_default(i, ns->ethtool.channels);
 
 	ethtool = debugfs_create_dir("ethtool", ns->nsim_dev_port->ddir);
 	ns->ethtool_ddir = ethtool;
