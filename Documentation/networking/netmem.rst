@@ -65,12 +65,21 @@ need to support ``netmem``.
    should avoid per-``netmem``-type branching and instead delegate operations
    to ``netmem`` helpers that handle the underlying memory type.
 
-5. **Do not mix skb fragment memory sources**: All ``frags[]`` in an
-   ``sk_buff`` must either be ``struct page``-backed or belong to the same
-   memory provider instance (for example, the same ``devmem`` binding or
-   ``io_uring`` area). Mixing ``struct page`` and memory-provider fragments,
-   or mixing fragments from different memory providers within a single
-   ``sk_buff``, is not allowed (including when coalescing ``sk_buff``\ s).
+5. **Do not mix skb fragment memory sources (check only ``frags[0]``)**: All
+   ``frags[]`` in an ``sk_buff`` must either be ``struct page``-backed or
+   belong to the same memory provider instance (for example, the same
+   ``devmem`` binding or ``io_uring`` area). Mixing ``struct page`` and
+   memory-provider fragments, or mixing fragments from different memory
+   providers within a single ``sk_buff``, is not allowed (including when
+   coalescing ``sk_buff``\ s).
+
+   **Important corollary — never loop over ``frags[]`` to inspect fragment
+   memory type:** Because all fragments in an ``sk_buff`` are guaranteed to be
+   homogeneous, any code that needs to test whether an ``sk_buff`` holds
+   ``net_iov`` fragments or inspect its memory provider must only check
+   ``frags[0]`` (for example,
+   ``shinfo->nr_frags && skb_frag_is_net_iov(&shinfo->frags[0])``), rather than
+   iterating across ``0 .. shinfo->nr_frags - 1``.
 
 Driver RX Requirements
 ======================
