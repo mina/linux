@@ -7477,8 +7477,8 @@ void skb_attempt_defer_free(struct sk_buff *skb)
 	if (static_branch_unlikely(&skb_defer_disable_key))
 		goto nodefer;
 
-	/* zero copy notifications should not be delayed. */
-	if (skb_zcopy(skb))
+	/* zero copy notifications and devmem token release should not be delayed. */
+	if (skb_zcopy(skb) || !skb_frags_readable(skb))
 		goto nodefer;
 
 	cpu = skb->alloc_cpu;
