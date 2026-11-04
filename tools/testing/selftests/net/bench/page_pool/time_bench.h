@@ -8,6 +8,9 @@
 #ifndef _LINUX_TIME_BENCH_H
 #define _LINUX_TIME_BENCH_H
 
+#include <linux/ktime.h>
+#include <linux/timex.h>
+
 /* Main structure used for recording a benchmark run */
 struct time_bench_record {
 	uint32_t version_abi;
@@ -100,6 +103,7 @@ struct time_bench_cpu {
  *  RDTSC only change "%rax" and "%rdx" but
  *  CPUID clears the high 32-bits of all (rax/rbx/rcx/rdx)
  */
+#ifdef CONFIG_X86_64
 static __always_inline uint64_t tsc_start_clock(void)
 {
 	/* See: Intel Doc #324264 */
@@ -110,7 +114,6 @@ static __always_inline uint64_t tsc_start_clock(void)
 		     "mov %%edx, %0\n\t"
 		     "mov %%eax, %1\n\t"
 		     : "=r"(hi), "=r"(lo)::"%rax", "%rbx", "%rcx", "%rdx");
-	//FIXME: on 32bit use clobbered %eax + %edx
 	return ((uint64_t)lo) | (((uint64_t)hi) << 32);
 }
 
@@ -126,6 +129,21 @@ static __always_inline uint64_t tsc_stop_clock(void)
 		     : "=r"(hi), "=r"(lo)::"%rax", "%rbx", "%rcx", "%rdx");
 	return ((uint64_t)lo) | (((uint64_t)hi) << 32);
 }
+#else
+static __always_inline uint64_t tsc_start_clock(void)
+{
+	cycles_t c = get_cycles();
+
+	return c ? (uint64_t)c : ktime_get_ns();
+}
+
+static __always_inline uint64_t tsc_stop_clock(void)
+{
+	cycles_t c = get_cycles();
+
+	return c ? (uint64_t)c : ktime_get_ns();
+}
+#endif
 
 /** Wall-clock based **
  *
@@ -161,6 +179,7 @@ enum {
 	FIXED_CPU_CLK_UNHALTED_REF = 2,
 };
 
+#ifdef CONFIG_X86_64
 static __always_inline unsigned int long long p_rdpmc(unsigned int in)
 {
 	unsigned int d, a;
@@ -168,6 +187,12 @@ static __always_inline unsigned int long long p_rdpmc(unsigned int in)
 	asm volatile("rdpmc" : "=d"(d), "=a"(a) : "c"(in) : "memory");
 	return ((unsigned long long)d << 32) | a;
 }
+#else
+static __always_inline unsigned long long p_rdpmc(unsigned int in)
+{
+	return 0;
+}
+#endif
 
 /* These PMU counter needs to be enabled, but I don't have the
  * configure code implemented.  My current hack is running:
@@ -185,6 +210,7 @@ static __always_inline unsigned long long pmc_clk(void)
 	return p_rdpmc(FIXED_SELECT | FIXED_CPU_CLK_UNHALTED_CORE);
 }
 
+#ifdef CONFIG_X86_64
 /* Raw reading via MSR rdmsr() is likely wrong
  * FIXME: How can I know which raw MSR registers are conf for what?
  */
@@ -195,10 +221,11 @@ static inline uint64_t msr_inst(unsigned long long *msr_result)
 {
 	return rdmsrq_safe(MSR_IA32_PCM0, msr_result);
 }
+#endif
 
 /** Generic functions **
  */
-bool time_bench_loop(uint32_t loops, int step, char *txt, void *data,
+bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		     int (*func)(struct time_bench_record *rec, void *data));
 bool time_bench_calc_stats(struct time_bench_record *rec);
 
