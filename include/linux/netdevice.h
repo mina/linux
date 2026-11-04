@@ -362,6 +362,10 @@ struct gro_list {
  * @rx_list: list of pending ``GRO_NORMAL`` skbs
  * @rx_count: cached current length of @rx_list
  * @cached_napi_id: napi_struct::napi_id cached for hotpath, 0 for standalone
+ * @max_flows: per-bucket flow limit override (0 uses ``MAX_GRO_SKBS``)
+ * @hw_mode: single-bucket FIFO hardware GRO emulation mode
+ * @hw_gro_packets: count of aggregated super-packets completed
+ * @hw_gro_wire_packets: count of wire segments merged into @hw_gro_packets
  */
 struct gro_node {
 	unsigned long		bitmask;
@@ -369,6 +373,10 @@ struct gro_node {
 	struct list_head	rx_list;
 	u32			rx_count;
 	u32			cached_napi_id;
+	u16			max_flows;
+	bool			hw_mode;
+	u64			hw_gro_packets;
+	u64			hw_gro_wire_packets;
 };
 
 /*

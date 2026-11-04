@@ -539,7 +539,8 @@ static inline void gro_normal_one(struct gro_node *gro, struct sk_buff *skb,
 {
 	list_add_tail(&skb->list, &gro->rx_list);
 	gro->rx_count += segs;
-	if (gro->rx_count >= READ_ONCE(net_hotdata.gro_normal_batch))
+	if (!gro->hw_mode &&
+	    gro->rx_count >= READ_ONCE(net_hotdata.gro_normal_batch))
 		gro_normal_list(gro);
 }
 

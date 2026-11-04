@@ -301,6 +301,9 @@ static void gro_complete(struct gro_node *gro, struct sk_buff *skb)
 		return;
 	}
 
+	gro->hw_gro_packets++;
+	gro->hw_gro_wire_packets += NAPI_GRO_CB(skb)->count;
+
 out:
 	gro_normal_one(gro, skb, NAPI_GRO_CB(skb)->count);
 }
@@ -480,7 +483,9 @@ static void gro_flush_oldest(struct gro_node *gro, struct list_head *head)
 static enum gro_result dev_gro_receive(struct gro_node *gro,
 				       struct sk_buff *skb)
 {
-	u32 bucket = skb_get_hash_raw(skb) & (GRO_HASH_BUCKETS - 1);
+	u32 bucket = gro->hw_mode ? 0 :
+		(skb_get_hash_raw(skb) & (GRO_HASH_BUCKETS - 1));
+	u32 max_skbs = gro->max_flows ?: MAX_GRO_SKBS;
 	struct list_head *head = &net_hotdata.offload_base;
 	struct gro_list *gro_list = &gro->hash[bucket];
 	struct packet_offload *ptype;
@@ -489,7 +494,7 @@ static enum gro_result dev_gro_receive(struct gro_node *gro,
 	enum gro_result ret;
 	int same_flow;
 
-	if (netif_elide_gro(skb->dev))
+	if (!gro->hw_mode && netif_elide_gro(skb->dev))
 		goto normal;
 
 	gro_list_prepare(&gro_list->list, skb);
@@ -557,7 +562,7 @@ found_ptype:
 	if (NAPI_GRO_CB(skb)->flush)
 		goto normal;
 
-	if (unlikely(gro_list->count >= MAX_GRO_SKBS))
+	if (unlikely(gro_list->count >= max_skbs))
 		gro_flush_oldest(gro, &gro_list->list);
 	else
 		gro_list->count++;
@@ -828,6 +833,10 @@ void gro_init(struct gro_node *gro)
 
 	gro->bitmask = 0;
 	gro->cached_napi_id = 0;
+	gro->max_flows = 0;
+	gro->hw_mode = false;
+	gro->hw_gro_packets = 0;
+	gro->hw_gro_wire_packets = 0;
 
 	INIT_LIST_HEAD(&gro->rx_list);
 	gro->rx_count = 0;
