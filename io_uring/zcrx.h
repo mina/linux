@@ -4,6 +4,7 @@
 
 #include <linux/io_uring_types.h>
 #include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 #include <linux/socket.h>
 #include <net/page_pool/types.h>
 #include <net/net_trackers.h>
@@ -26,6 +27,7 @@ struct io_zcrx_mem {
 
 	struct dma_buf_attachment	*attach;
 	struct dma_buf			*dmabuf;
+	struct iosys_map		vmap;
 };
 
 struct io_zcrx_area {

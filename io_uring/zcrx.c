@@ -144,6 +144,10 @@ static void io_release_dmabuf(struct io_zcrx_mem *mem)
 {
 	if (!IS_ENABLED(CONFIG_DMA_SHARED_BUFFER))
 		return;
+	if (!iosys_map_is_null(&mem->vmap)) {
+		dma_buf_vunmap_unlocked(mem->dmabuf, &mem->vmap);
+		iosys_map_clear(&mem->vmap);
+	}
 	if (mem->dmabuf)
 		dma_buf_put(mem->dmabuf);
 	mem->dmabuf = NULL;
@@ -188,6 +192,8 @@ static int io_import_dmabuf(struct io_zcrx_ifq *ifq,
 		mem->sgt = NULL;
 		goto err;
 	}
+	if (dma_buf_vmap_unlocked(mem->dmabuf, &mem->vmap))
+		iosys_map_clear(&mem->vmap);
 
 	for_each_sgtable_dma_sg(mem->sgt, sg, i)
 		total_size += sg_dma_len(sg);
@@ -204,6 +210,70 @@ err:
 	io_release_dmabuf(mem);
 	return ret;
 }
+
+int io_zcrx_niov_copy_to_buf(const struct net_iov *niov, size_t off,
+			     void *dst, size_t len)
+{
+	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
+	size_t area_off = ((size_t)net_iov_idx(niov) << area->ifq->niov_shift) +
+			  off;
+
+	if (area_off + len > area->mem.size)
+		return -EINVAL;
+
+	if (area->mem.is_dmabuf) {
+		if (iosys_map_is_null(&area->mem.vmap))
+			return -EOPNOTSUPP;
+		iosys_map_memcpy_from(dst, &area->mem.vmap, area_off, len);
+		return 0;
+	}
+
+	while (len) {
+		struct page *page = area->mem.pages[area_off >> PAGE_SHIFT];
+		size_t p_off = offset_in_page(area_off);
+		size_t chunk = min_t(size_t, len, PAGE_SIZE - p_off);
+
+		memcpy_from_page(dst, page, p_off, chunk);
+		dst += chunk;
+		area_off += chunk;
+		len -= chunk;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(io_zcrx_niov_copy_to_buf, "NETDEV_INTERNAL");
+
+int io_zcrx_niov_copy_from_buf(struct net_iov *niov, size_t off,
+			       const void *src, size_t len)
+{
+	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
+	size_t area_off = ((size_t)net_iov_idx(niov) << area->ifq->niov_shift) +
+			  off;
+
+	if (area_off + len > area->mem.size)
+		return -EINVAL;
+
+	if (area->mem.is_dmabuf) {
+		if (iosys_map_is_null(&area->mem.vmap))
+			return -EOPNOTSUPP;
+		iosys_map_memcpy_to(&area->mem.vmap, area_off, src, len);
+		return 0;
+	}
+
+	while (len) {
+		struct page *page = area->mem.pages[area_off >> PAGE_SHIFT];
+		size_t p_off = offset_in_page(area_off);
+		size_t chunk = min_t(size_t, len, PAGE_SIZE - p_off);
+
+		memcpy_to_page(page, p_off, src, chunk);
+		src += chunk;
+		area_off += chunk;
+		len -= chunk;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(io_zcrx_niov_copy_from_buf, "NETDEV_INTERNAL");
 
 static unsigned long io_count_account_pages(struct page **pages, unsigned nr_pages)
 {

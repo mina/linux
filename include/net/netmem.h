@@ -146,6 +146,52 @@ static inline int net_devmem_niov_copy_from_buf(struct net_iov *niov,
 }
 #endif
 
+#if defined(CONFIG_IO_URING_ZCRX)
+int io_zcrx_niov_copy_to_buf(const struct net_iov *niov, size_t off,
+			     void *dst, size_t len);
+int io_zcrx_niov_copy_from_buf(struct net_iov *niov, size_t off,
+			       const void *src, size_t len);
+#else
+static inline int io_zcrx_niov_copy_to_buf(const struct net_iov *niov,
+					   size_t off, void *dst, size_t len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int io_zcrx_niov_copy_from_buf(struct net_iov *niov,
+					     size_t off, const void *src,
+					     size_t len)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+static inline int net_iov_copy_to_buf(const struct net_iov *niov, size_t off,
+				      void *dst, size_t len)
+{
+	switch (niov->type) {
+	case NET_IOV_DMABUF:
+		return net_devmem_niov_copy_to_buf(niov, off, dst, len);
+	case NET_IOV_IOURING:
+		return io_zcrx_niov_copy_to_buf(niov, off, dst, len);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static inline int net_iov_copy_from_buf(struct net_iov *niov, size_t off,
+					const void *src, size_t len)
+{
+	switch (niov->type) {
+	case NET_IOV_DMABUF:
+		return net_devmem_niov_copy_from_buf(niov, off, src, len);
+	case NET_IOV_IOURING:
+		return io_zcrx_niov_copy_from_buf(niov, off, src, len);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 /* netmem */
 
 /**
