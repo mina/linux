@@ -69,8 +69,8 @@ def _exchg_udp(cfg, port, test_string):
     """
     cfg.require_cmd("socat", remote=True)
 
-    rx_udp_cmd = f"socat -{cfg.addr_ipver} -T 2 -u UDP-RECV:{port},reuseport STDOUT"
-    tx_udp_cmd = f"echo -n {test_string} | socat -t 2 -u STDIN UDP:{cfg.baddr}:{port},shut-none"
+    rx_udp_cmd = f"socat -{cfg.addr_ipver} -T 0.5 -u UDP-RECV:{port},reuseport STDOUT"
+    tx_udp_cmd = f"echo -n {test_string} | socat -t 0.1 -u STDIN UDP:{cfg.baddr}:{port},shut-none"
 
     with bkg(rx_udp_cmd, exit_wait=True) as nc:
         wait_port_listen(port, proto="udp")
@@ -293,14 +293,14 @@ def _test_xdp_native_tx(cfg, bpf_info, payload_lens):
             random.choice(string.ascii_lowercase) for _ in range(payload_len)
         )
 
-        rx_udp = f"socat -{cfg.addr_ipver} -T 2 " + \
+        rx_udp = f"socat -{cfg.addr_ipver} -T 0.5 " + \
                  f"-u UDP-RECV:{port},reuseport STDOUT"
 
         # Writing zero bytes to stdin gets ignored by socat,
         # but with the shut-null flag socat generates a zero sized packet
         # when the socket is closed.
         tx_cmd_suffix = ",shut-null" if payload_len == 0 else ",shut-none"
-        tx_udp = f"echo -n {test_string} | socat -t 2 " + \
+        tx_udp = f"echo -n {test_string} | socat -t 0.1 " + \
                  f"-u STDIN UDP:{cfg.baddr}:{port}{tx_cmd_suffix}"
 
         with bkg(rx_udp, host=cfg.remote, exit_wait=True) as rnc:
@@ -703,7 +703,7 @@ def test_xdp_native_qstats(cfg, act, ipver):
     bpf_map_set("map_xdp_setup", TestConfig.PORT.value, port)
 
     # Discard the input, but we need a listener to avoid ICMP errors
-    rx_udp = f"socat -{cfg.addr_ipver} -T 2 -u UDP-RECV:{port},reuseport " + \
+    rx_udp = f"socat -{cfg.addr_ipver} -T 0.5 -u UDP-RECV:{port},reuseport " + \
         "/dev/null"
     # Listener runs on "remote" in case of XDP_TX
     rx_host = cfg.remote if act == XDPAction.TX else None

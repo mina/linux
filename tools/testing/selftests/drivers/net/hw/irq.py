@@ -85,7 +85,7 @@ def check_down(cfg) -> None:
 
 
 def main() -> None:
-    with NetDrvEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEnv(__file__) as cfg:
         cfg.ethnl = EthtoolFamily()
         cfg.netnl = NetdevFamily()
 

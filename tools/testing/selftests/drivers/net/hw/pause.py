@@ -928,7 +928,7 @@ def pause_autoneg_link_autoneg(cfg):
 
 def main():
     """ Entry point """
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         ksft_run([pause_test_support,
                   pause_advertising_test,
                   pause_aneg_resolution,

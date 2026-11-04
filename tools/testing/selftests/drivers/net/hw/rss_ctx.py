@@ -301,7 +301,6 @@ def test_rss_queue_reconfigure(cfg, main_ctx=True):
             ksft_pr("Driver does not support rss + queue offset")
             return
 
-        defer(ethtool, f"-N {cfg.ifname} delete {ntuple2}")
         # should replace existing filter
         ksft_eq(ntuple, ntuple2)
         _send_traffic_check(cfg, port, ctx_ref, { 'target': (1, 3),
@@ -1015,7 +1014,7 @@ def test_rss_context_persist_ifdown_and_create(cfg):
 
 
 def main() -> None:
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         cfg.context_cnt = None
         cfg.ethnl = EthtoolFamily()
         cfg.netdevnl = NetdevFamily()

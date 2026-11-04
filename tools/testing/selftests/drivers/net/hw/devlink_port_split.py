@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0
 
 from subprocess import PIPE, Popen
+import atexit
 import json
+import os
+import random
 import time
 import argparse
 import collections
@@ -263,8 +266,21 @@ def main(cmdline=None):
         stdout, stderr = run_command(cmd)
         assert stderr == ""
 
-        validate_devlink_output(json.loads(stdout))
-        devs = json.loads(stdout)['dev']
+        devs = json.loads(stdout).get('dev', {})
+        if not devs and os.path.exists("/sys/bus/netdevsim/new_device"):
+            nsim_id = random.randrange(1000, 30000)
+            with open("/sys/bus/netdevsim/new_device", "w", encoding="utf-8") as f:
+                f.write(f"{nsim_id} 2 4\n")
+            atexit.register(
+                lambda: open(  # pylint: disable=R1732
+                    "/sys/bus/netdevsim/del_device", "w", encoding="utf-8"
+                ).write(f"{nsim_id}\n")
+            )
+            stdout, stderr = run_command(cmd)
+            assert stderr == ""
+            devs = json.loads(stdout).get('dev', {})
+
+        validate_devlink_output({"dev": devs})
         dev = list(devs.keys())[0]
 
     cmd = "devlink dev show %s" % dev

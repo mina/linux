@@ -245,10 +245,14 @@ def run_big_tcp_stream(cfg, ipver, remote_v4, remote_v6):
 
 
 def build_tunnel(cfg, outer_ipver, tun_info):
-    local_v4  = NetDrvEpEnv.nsim_v4_pfx + "1"
-    local_v6  = NetDrvEpEnv.nsim_v6_pfx + "1"
-    remote_v4 = NetDrvEpEnv.nsim_v4_pfx + "2"
-    remote_v6 = NetDrvEpEnv.nsim_v6_pfx + "2"
+    v4_pfx = ("198.51.100." if cfg.addr_v["4"] == NetDrvEpEnv.nsim_v4_pfx + "1"
+              else NetDrvEpEnv.nsim_v4_pfx)
+    v6_pfx = ("2001:db8:1::" if cfg.addr_v["6"] == NetDrvEpEnv.nsim_v6_pfx + "1"
+              else NetDrvEpEnv.nsim_v6_pfx)
+    local_v4  = v4_pfx + "1"
+    local_v6  = v6_pfx + "1"
+    remote_v4 = v4_pfx + "2"
+    remote_v6 = v6_pfx + "2"
 
     local_addr  = cfg.addr_v[outer_ipver]
     remote_addr = cfg.remote_addr_v[outer_ipver]
@@ -259,14 +263,14 @@ def build_tunnel(cfg, outer_ipver, tun_info):
     defer(ip, f"link del {tun_type}-ksft")
     ip(f"link set dev {tun_type}-ksft up")
     ip(f"addr add {local_v4}/24 dev {tun_type}-ksft")
-    ip(f"addr add {local_v6}/64 dev {tun_type}-ksft")
+    ip(f"-6 addr add {local_v6}/64 dev {tun_type}-ksft nodad")
 
     ip(f"link add {tun_type}-ksft type {tun_type} {tun_arg} local {remote_addr} remote {local_addr} dev {cfg.remote_ifname}",
         host=cfg.remote)
     defer(ip, f"link del {tun_type}-ksft", host=cfg.remote)
     ip(f"link set dev {tun_type}-ksft up", host=cfg.remote)
     ip(f"addr add {remote_v4}/24 dev {tun_type}-ksft", host=cfg.remote)
-    ip(f"addr add {remote_v6}/64 dev {tun_type}-ksft", host=cfg.remote)
+    ip(f"-6 addr add {remote_v6}/64 dev {tun_type}-ksft nodad", host=cfg.remote)
 
     return remote_v4, remote_v6
 
@@ -379,7 +383,7 @@ def query_nic_features(cfg) -> None:
 
 
 def main() -> None:
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         cfg.ethnl = EthtoolFamily()
         cfg.netnl = NetdevFamily()
 

@@ -107,6 +107,7 @@ class NetDrvEnv(NetDrvEnvBase):
             if nsim_test is False:
                 raise KsftXfailEx("Test does not work on netdevsim")
 
+            kwargs.setdefault("queue_count", 8)
             self._ns = NetdevSimDev(**kwargs)
             self.dev = self._ns.nsims[0].dev
         self.ifname = self.dev['ifname']
@@ -193,9 +194,7 @@ class NetDrvEpEnv(NetDrvEnvBase):
         self._required_cmd = {}
 
     def create_local(self):
-        nsim_kwargs = {}
-        if self._queue_count:
-            nsim_kwargs["queue_count"] = self._queue_count
+        nsim_kwargs = {"queue_count": self._queue_count or 8}
 
         self._netns = NetNS()
         self._ns = NetdevSimDev(**nsim_kwargs)

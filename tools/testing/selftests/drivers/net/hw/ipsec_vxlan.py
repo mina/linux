@@ -195,7 +195,7 @@ def test_vxlan_ipsec_crypto_offload(cfg, outer_ipver, inner_ipver):
 
 def main():
     """Runs VXLAN+IPsec crypto-offload GSO selftest."""
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         ksft_run([test_vxlan_ipsec_crypto_offload], args=(cfg,))
     ksft_exit()
 

@@ -466,7 +466,7 @@ def test_rss_ctx_ntf(cfg):
 def main() -> None:
     """ Ksft boiler plate main """
 
-    with NetDrvEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEnv(__file__) as cfg:
         cfg.ethnl = EthtoolFamily()
         ksft_run(globs=globals(), case_pfx={"test_"}, args=(cfg, ))
     ksft_exit()

@@ -7,10 +7,8 @@ endif
 
 # Check if io_uring supports zero-copy receive
 HAS_IOURING_ZCRX := $(shell \
-	echo -e '#include <liburing.h>\n' \
-	     'void *func = (void *)io_uring_register_ifq;\n' \
-	     'int main() {return 0;}' | \
-	$(CC) -luring -x c - -o /dev/null 2>&1 && echo y)
+	printf '#include <liburing.h>\nvoid *func = (void *)io_uring_register_ifq;\nint main() {return 0;}\n' | \
+	$(CC) -x c - -luring -o /dev/null 2>&1 && echo y)
 
 ifeq ($(HAS_IOURING_ZCRX),y)
 COND_GEN_FILES += iou-zcrx

@@ -134,7 +134,7 @@ def test_pp_alloc(cfg, netdevnl):
 def main() -> None:
     """ Ksft boiler plate main """
     netdevnl = NetdevFamily()
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
 
         ksft_run([test_pp_alloc], args=(cfg, netdevnl, ))
     ksft_exit()

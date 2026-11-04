@@ -213,7 +213,7 @@ def test_hwtstamp_rx_ioctl(cfg):
 def main() -> None:
     """ Ksft boiler plate main """
 
-    with NetDrvEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEnv(__file__) as cfg:
         cfg.ethnl = EthtoolFamily()
         ksft_run([test_hwtstamp_tx_ioctl, test_hwtstamp_tx_netlink,
                   test_hwtstamp_rx_ioctl, test_hwtstamp_rx_netlink],

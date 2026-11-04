@@ -208,7 +208,7 @@ lldp()
 {
 	RET=0
 
-	systemctl start lldpad
+	systemctl start lldpad 2>/dev/null || lldpad -d
 
 	# Configure the interfaces to receive and transmit LLDPDUs
 	lldptool -L -i $h1 adminStatus=rxtx >/dev/null
@@ -247,7 +247,7 @@ lldp()
 	traffic_test $h2 "pmac"
 	check_err "$?" "Traffic did not get sent through $h2's pMAC"
 
-	systemctl stop lldpad
+	systemctl stop lldpad 2>/dev/null || pkill -x lldpad || true
 
 	log_test "LLDP"
 }

@@ -12,7 +12,7 @@ ALL_TESTS="
 NUM_NETIFS=2
 lib_dir=$(dirname "$0")
 source "$lib_dir"/../../../net/forwarding/lib.sh
-source ethtool_lib.sh
+source "$lib_dir"/ethtool_lib.sh
 
 h1_create()
 {

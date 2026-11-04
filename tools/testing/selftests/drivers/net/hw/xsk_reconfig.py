@@ -51,7 +51,7 @@ def check_rx_resize(cfg):
         ethtool(f"-G %s rx %d" % (cfg.ifname, rx_ring))
 
 def main():
-    with NetDrvEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEnv(__file__) as cfg:
         ksft_run([check_xdp_bind, check_rx_resize],
                  args=(cfg, ))
     ksft_exit()

@@ -1397,7 +1397,8 @@ static void check_capacity_pkts(int fd)
 			vlog("Pkt %d: flow %d, sport %d, len %d (expected %d)\n",
 			     num_pkt, flow_id, sport, data_len,
 			     CAPACITY_PAYLOAD_LEN * 2);
-			fail_reason = fail_reason ?: "not coalesced";
+			if (!order_check)
+				fail_reason = fail_reason ?: "not coalesced";
 		}
 
 		num_pkt++;

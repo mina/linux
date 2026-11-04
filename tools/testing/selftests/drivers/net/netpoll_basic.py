@@ -52,7 +52,7 @@ NETCONS_LOCAL_PORT: int = 1514
 
 # Max number of netcons messages to send. Each iteration will setup
 # netconsole and send MAX_WRITES messages
-ITERATIONS: int = 20
+ITERATIONS: int = 90
 # Number of writes to /dev/kmsg per iteration
 MAX_WRITES: int = 40
 # MAPS contains the information coming from bpftrace it will have only one
@@ -61,7 +61,7 @@ MAPS: dict[str, int] = {}
 # Thread to run bpftrace in parallel
 BPF_THREAD: Optional[threading.Thread] = None
 # Time bpftrace will be running in parallel.
-BPFTRACE_TIMEOUT: int = 10
+BPFTRACE_TIMEOUT: int = 5
 
 
 def ethtool_get_ringsize(interface_name: str) -> tuple[int, int]:
@@ -329,8 +329,19 @@ def do_netpoll_flush(cfg: NetDrvEpEnv, ifname: str, target_name: str) -> None:
         time.sleep(0.4)
 
 
+def set_printk_loglevel(val: str) -> None:
+    """Set /proc/sys/kernel/printk values"""
+    with open("/proc/sys/kernel/printk", "w", encoding="utf-8") as printk:
+        printk.write(val)
+
+
 def configure_network(ifname: str) -> None:
     """Configure ring size and queue numbers"""
+
+    with open("/proc/sys/kernel/printk", "r", encoding="utf-8") as printk:
+        prev_printk = printk.read()
+    set_printk_loglevel("6 5\n")
+    defer(set_printk_loglevel, prev_printk)
 
     # Set defined queues to 1 to force congestion
     prev_queues = ethtool_get_queues_cnt(ifname)

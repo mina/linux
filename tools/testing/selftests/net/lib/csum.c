@@ -1012,6 +1012,10 @@ static void do_rx(int fdp, int fdr)
 		if (cfg_proto == IPPROTO_UDP)
 			count_udp += recv_udp(fdr);
 
+		if (count_pkt >= cfg_num_pkt && !cfg_bad_csum &&
+		    (cfg_proto != IPPROTO_UDP || count_udp >= cfg_num_pkt))
+			break;
+
 		tleft = tstop - gettimeofday_ms();
 	} while (tleft > 0);
 

@@ -161,7 +161,7 @@ def test_rss_flow_label_6only(cfg):
 
 
 def main() -> None:
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         ksft_run([test_rss_flow_label,
                   test_rss_flow_label_6only],
                  args=(cfg, ))

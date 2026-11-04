@@ -292,7 +292,7 @@ def test_gro_order(cfg, num_flows):
 def main() -> None:
     """ Ksft boiler plate main """
 
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         cfg.netnl = NetdevFamily()
         ksft_run([test_gro_stats_single,
                   test_gro_stats_full,

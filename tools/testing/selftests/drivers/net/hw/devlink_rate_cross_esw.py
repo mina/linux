@@ -66,15 +66,21 @@ def discover_pfs(cfg):
 
 
 def get_pci_addr(ifname):
-    """Resolves PCI address for a network interface."""
+    """Resolves PCI or netdevsim device address for a network interface."""
     return os.path.basename(os.path.realpath(f"/sys/class/net/{ifname}/device"))
+
+
+def get_bus_name(dev_addr):
+    """Returns devlink bus name for a device address."""
+    return "netdevsim" if dev_addr.startswith("netdevsim") else "pci"
 
 
 def get_vf_port_index(pf_pci):
     """Finds devlink port-index for vf0 under pf_pci."""
+    bus = get_bus_name(pf_pci)
     ports = tool("devlink", "port show", json=True)["port"]
     for port_name, props in ports.items():
-        if port_name.startswith(f"pci/{pf_pci}/") and props.get("vfnum") == 0:
+        if port_name.startswith(f"{bus}/{pf_pci}/") and props.get("vfnum") == 0:
             return int(port_name.split("/")[-1])
     raise KsftSkipEx(f"VF port not found for {pf_pci}")
 
@@ -86,11 +92,15 @@ def cleanup_esw(pf):
 
 def setup_esw(pf):
     """Creates 1 VF on 'pf'."""
+    pf_pci = get_pci_addr(pf)
+    bus = get_bus_name(pf_pci)
+    if bus == "netdevsim":
+        cmd(f"devlink dev eswitch set {bus}/{pf_pci} mode switchdev", fail=False)
     path = f"/sys/class/net/{pf}/device/sriov_numvfs"
     cmd(f"echo 0 > {path}", shell=True)
     cmd(f"echo 1 > {path}", shell=True)
     defer(cleanup_esw, pf)
-    time.sleep(2)
+    time.sleep(0.2 if bus == "netdevsim" else 2)
 
     vf_dir = f"/sys/class/net/{pf}/device/virtfn0/net"
     entries = os.listdir(vf_dir) if os.path.isdir(vf_dir) else []
@@ -98,7 +108,6 @@ def setup_esw(pf):
         raise KsftSkipEx(f"VF not found for {pf}")
     ip(f"link set dev {entries[0]} up")
 
-    pf_pci = get_pci_addr(pf)
     vf_idx = get_vf_port_index(pf_pci)
     ksft_pr(f"Created VF {vf_idx} on PF {pf} ({pf_pci})")
     return pf_pci, vf_idx
@@ -110,7 +119,7 @@ def setup_esw(pf):
 def rate_new(devnl, dev_pci, node_name, **kwargs):
     """Creates rate node."""
     params = {
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "rate-node-name": node_name,
     }
@@ -126,7 +135,7 @@ def rate_new(devnl, dev_pci, node_name, **kwargs):
 def rate_get(devnl, dev_pci, node_name):
     """Gets rate node."""
     params = {
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "rate-node-name": node_name,
     }
@@ -136,7 +145,7 @@ def rate_get(devnl, dev_pci, node_name):
 def rate_get_leaf(devnl, dev_pci, port_index):
     """Gets rate leaf (VF)."""
     params = {
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "port-index": port_index,
     }
@@ -146,7 +155,7 @@ def rate_get_leaf(devnl, dev_pci, port_index):
 def rate_del(devnl, dev_pci, node_name):
     """Deletes rate node."""
     devnl.rate_del({
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "rate-node-name": node_name,
     })
@@ -155,7 +164,7 @@ def rate_del(devnl, dev_pci, node_name):
 def rate_set_leaf(devnl, dev_pci, port_index, **kwargs):
     """Sets rate attributes on a leaf (VF)."""
     params = {
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "port-index": port_index,
     }
@@ -172,14 +181,14 @@ def rate_set_leaf_parent(devnl, dev_pci, port_index,
                          parent_name, parent_dev_pci=None):
     """Sets a leaf's parent, optionally cross-esw."""
     params = {
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "port-index": port_index,
         "rate-parent-node-name": parent_name,
     }
     if parent_dev_pci:
         params["parent-dev"] = {
-            "bus-name": "pci",
+            "bus-name": get_bus_name(parent_dev_pci),
             "dev-name": parent_dev_pci,
         }
     try:
@@ -200,7 +209,7 @@ def rate_clear_leaf_parent(devnl, dev_pci, port_index):
 def rate_set_node(devnl, dev_pci, node_name, **kwargs):
     """Sets rate attributes on a node."""
     params = {
-        "bus-name": "pci",
+        "bus-name": get_bus_name(dev_pci),
         "dev-name": dev_pci,
         "rate-node-name": node_name,
     }
@@ -278,17 +287,47 @@ def test_tx_rates_on_cross_esw(cfg):
 def main() -> None:
     """Main function."""
 
-    with NetDrvEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEnv(__file__) as cfg:
         cfg.devnl = DevlinkFamily()
+        nsim_ids = []
+        bond_name = None
 
-        ksft_run(
-            cases=[
-                test_same_esw_parent,
-                test_cross_esw_parent,
-                test_tx_rates_on_cross_esw,
-            ],
-            args=(cfg,),
-        )
+        if cfg._ns is not None:  # pylint: disable=W0212
+            chip_id = cfg._ns.addr  # pylint: disable=W0212
+            id0 = chip_id + 10000
+            id1 = chip_id + 10001
+            with open("/sys/bus/netdevsim/new_device", "w", encoding="utf-8") as f:
+                f.write(f"{id0} 1 4 {chip_id}\n")
+            nsim_ids.append(id0)
+            with open("/sys/bus/netdevsim/new_device", "w", encoding="utf-8") as f:
+                f.write(f"{id1} 1 4 {chip_id}\n")
+            nsim_ids.append(id1)
+            pf0_if = os.listdir(f"/sys/bus/netdevsim/devices/netdevsim{id0}/net")[0]
+            pf1_if = os.listdir(f"/sys/bus/netdevsim/devices/netdevsim{id1}/net")[0]
+            bond_name = f"bond_{os.getpid()}"
+            ip(f"link add name {bond_name} type bond mode active-backup")
+            ip(f"link set dev {pf0_if} down")
+            ip(f"link set dev {pf1_if} down")
+            ip(f"link set dev {pf0_if} master {bond_name}")
+            ip(f"link set dev {pf1_if} master {bond_name}")
+            ip(f"link set dev {bond_name} up")
+            cfg.ifname = bond_name
+
+        try:
+            ksft_run(
+                cases=[
+                    test_same_esw_parent,
+                    test_cross_esw_parent,
+                    test_tx_rates_on_cross_esw,
+                ],
+                args=(cfg,),
+            )
+        finally:
+            if bond_name:
+                ip(f"link del dev {bond_name}")
+            for nid in nsim_ids:
+                with open("/sys/bus/netdevsim/del_device", "w", encoding="utf-8") as f:
+                    f.write(f"{nid}\n")
     ksft_exit()
 
 

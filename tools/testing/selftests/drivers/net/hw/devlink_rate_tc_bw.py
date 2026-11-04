@@ -108,8 +108,8 @@ def setup_vf(cfg, set_tc_mapping=True):
     and optionally configures TC mapping using mqprio.
     """
     try:
-        cmd(f"devlink dev eswitch set pci/{cfg.pci} mode switchdev")
-        defer(cmd, f"devlink dev eswitch set pci/{cfg.pci} mode legacy")
+        cmd(f"devlink dev eswitch set {cfg.bus}/{cfg.pci} mode switchdev")
+        defer(cmd, f"devlink dev eswitch set {cfg.bus}/{cfg.pci} mode legacy")
     except Exception as exc:
         raise KsftSkipEx(f"Failed to enable switchdev mode on {cfg.pci}") from exc
     try:
@@ -117,7 +117,7 @@ def setup_vf(cfg, set_tc_mapping=True):
     except Exception as exc:
         raise KsftSkipEx(f"Failed to enable SR-IOV on {cfg.ifname}") from exc
 
-    time.sleep(2)
+    time.sleep(0.2 if cfg.bus == "netdevsim" else 2)
     vf_ifc = (os.listdir(
         f"/sys/class/net/{cfg.ifname}/device/virtfn0/net") or [None])[0]
     if vf_ifc:
@@ -161,7 +161,7 @@ def get_vf_info(cfg):
     for port_name, props in ports.items():
         netdev = props.get("netdev")
 
-        if (port_name.startswith(f"pci/{cfg.pci}/") and
+        if (port_name.startswith(f"{cfg.bus}/{cfg.pci}/") and
             props.get("vfnum") == 0):
             cfg.vf_representor = netdev
             cfg.vf_port_index = int(port_name.split("/")[-1])
@@ -199,7 +199,7 @@ def setup_devlink_rate(cfg):
         raise KsftSkipEx("Could not find VF port index")
     try:
         cfg.devnl.rate_set({
-            "bus-name": "pci",
+            "bus-name": cfg.bus,
             "dev-name": cfg.pci,
             "port-index": port_index,
             "rate-tx-max": 125000000,
@@ -416,7 +416,7 @@ def main() -> None:
     """
     Main entry point for running the test cases.
     """
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         cfg.devnl = DevlinkFamily()
 
         cfg.pci = os.path.basename(
@@ -424,6 +424,7 @@ def main() -> None:
         )
         if not cfg.pci:
             raise KsftSkipEx("Could not get PCI address of the interface")
+        cfg.bus = "netdevsim" if cfg.pci.startswith("netdevsim") else "pci"
 
         cfg.traffic_bw_validator = BandwidthValidator({"total": 1})
         cfg.tc_bw_validator = BandwidthValidator({"tc3": 20, "tc4": 80})

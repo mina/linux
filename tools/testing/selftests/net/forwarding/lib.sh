@@ -426,6 +426,51 @@ hw_stats_settle()
 : "${DRIVER_TEST_CONFORMANT:=no}"
 
 declare -A TARGETS
+declare -a NSIM_AUTO_IDS=()
+NSIM_AUTO_NETNS=""
+
+nsim_auto_cleanup()
+{
+	local id
+
+	if [[ -n "$NSIM_AUTO_NETNS" ]]; then
+		ip netns del "$NSIM_AUTO_NETNS" &> /dev/null || true
+		NSIM_AUTO_NETNS=""
+	fi
+	for id in "${NSIM_AUTO_IDS[@]}"; do
+		echo "$id" > /sys/bus/netdevsim/del_device 2>/dev/null || true
+	done
+	NSIM_AUTO_IDS=()
+}
+
+trap()
+{
+	if [[ $# -eq 2 && "$2" == "EXIT" && "$1" != "nsim_auto_cleanup" ]]; then
+		# shellcheck disable=SC2064
+		builtin trap "$1; nsim_auto_cleanup" EXIT
+	else
+		# shellcheck disable=SC2064
+		builtin trap "$@"
+	fi
+}
+builtin trap nsim_auto_cleanup EXIT
+
+nsim_alloc_dev()
+{
+	local id=$1; shift
+	local queues=${1:-8}; shift
+	local dev
+
+	echo "$id 1 $queues" > /sys/bus/netdevsim/new_device || return 1
+	udevadm settle 2>/dev/null || true
+	for dev in /sys/bus/netdevsim/devices/netdevsim"$id"/net/*; do
+		if [[ -d "$dev" ]]; then
+			basename "$dev"
+			return 0
+		fi
+	done
+	return 1
+}
 
 # Based on DRIVER_TEST_CONFORMANT, decide if to source drivers/net/net.config
 # or not. In the "yes" case, the test expects to pass the arguments through the
@@ -439,6 +484,40 @@ if [ "${DRIVER_TEST_CONFORMANT}" = "yes" ]; then
 	if (( NUM_NETIFS > 2)); then
 		echo "SKIP: DRIVER_TEST_CONFORMANT=yes and NUM_NETIFS is bigger than 2"
 		exit "$ksft_skip"
+	fi
+
+	if [[ -z "$NETIF" && -w /sys/bus/netdevsim/new_device ]]; then
+		nsim_base=$((30000 + ($$ % 15000) * 2))
+		while [[ -e /sys/bus/netdevsim/devices/netdevsim$nsim_base ||
+			 -e /sys/bus/netdevsim/devices/netdevsim$((nsim_base + 1)) ]]; do
+			nsim_base=$((nsim_base + 2))
+		done
+		NSIM_AUTO_IDS+=("$nsim_base" "$((nsim_base + 1))")
+		nsim_p1=$(nsim_alloc_dev "$nsim_base" 8)
+		nsim_p2=$(nsim_alloc_dev "$((nsim_base + 1))" 8)
+		NSIM_AUTO_NETNS="nsim_peer_$$"
+		ip netns add "$NSIM_AUTO_NETNS"
+		ip -n "$NSIM_AUTO_NETNS" link set lo up
+		ip link set dev "$nsim_p2" netns "$NSIM_AUTO_NETNS"
+		ifidx1=$(cat /sys/class/net/"$nsim_p1"/ifindex)
+		ifidx2=$(ip netns exec "$NSIM_AUTO_NETNS" cat /sys/class/net/"$nsim_p2"/ifindex)
+		exec 8</proc/self/ns/net 9</var/run/netns/"$NSIM_AUTO_NETNS"
+		echo "8:$ifidx1 9:$ifidx2" > /sys/bus/netdevsim/link_device
+		exec 8<&- 9<&-
+		ip link set dev "$nsim_p1" up
+		ip addr add 192.0.2.1/24 dev "$nsim_p1"
+		ip -6 addr add 2001:db8::1/64 dev "$nsim_p1" nodad
+		ip -n "$NSIM_AUTO_NETNS" link set dev "$nsim_p2" up
+		ip -n "$NSIM_AUTO_NETNS" addr add 192.0.2.2/24 dev "$nsim_p2"
+		ip -n "$NSIM_AUTO_NETNS" -6 addr add 2001:db8::2/64 dev "$nsim_p2" nodad
+		NETIF="$nsim_p1"
+		LOCAL_V4="192.0.2.1"
+		REMOTE_V4="192.0.2.2"
+		LOCAL_V6="2001:db8::1"
+		REMOTE_V6="2001:db8::2"
+		REMOTE_TYPE="netns"
+		REMOTE_ARGS="$NSIM_AUTO_NETNS"
+		WAIT_TIME=0
 	fi
 
 	check_env
@@ -493,6 +572,46 @@ else
 			TARGETS[$1]="local:"
 			shift
 		done
+	elif [[ -z "$NETIF_FIND_DRIVER" && -w /sys/bus/netdevsim/new_device &&
+		( "$NETIF_TYPE" == "netdevsim" ||
+		  "$(readlink -e "$0")" == */drivers/net/hw/* ) ]]; then
+		unset NETIFS
+		declare -A NETIFS
+		NETIF_CREATE=no
+		WAIT_TIME=0
+		nsim_cnt=${NUM_NETIFS:-2}
+		if (( nsim_cnt % 2 != 0 )); then
+			nsim_cnt=$((nsim_cnt + 1))
+		fi
+		nsim_total=$((nsim_cnt + 2))
+		nsim_base=$((30000 + ($$ % 15000) * 10))
+		while [[ -e /sys/bus/netdevsim/devices/netdevsim$nsim_base ]]; do
+			nsim_base=$((nsim_base + 10))
+		done
+		for ((i = 1; i <= nsim_total; ++i)); do
+			nsim_id=$((nsim_base + i - 1))
+			NSIM_AUTO_IDS+=("$nsim_id")
+			nsim_if=$(nsim_alloc_dev "$nsim_id" 8)
+			if (( i <= nsim_cnt )); then
+				NETIFS[p$i]="$nsim_if"
+				TARGETS[$nsim_if]="local:"
+			elif (( i == nsim_cnt + 1 )); then
+				NETIF_NO_CABLE="$nsim_if"
+			else
+				nsim_nc_peer="$nsim_if"
+			fi
+		done
+		exec 8</proc/self/ns/net
+		for ((i = 1; i <= nsim_cnt; i += 2)); do
+			ifidx1=$(cat /sys/class/net/"${NETIFS[p$i]}"/ifindex)
+			ifidx2=$(cat /sys/class/net/"${NETIFS[p$((i + 1))]}"/ifindex)
+			echo "8:$ifidx1 8:$ifidx2" > /sys/bus/netdevsim/link_device
+		done
+		ifidx_nc1=$(cat /sys/class/net/"$NETIF_NO_CABLE"/ifindex)
+		ifidx_nc2=$(cat /sys/class/net/"$nsim_nc_peer"/ifindex)
+		echo "8:$ifidx_nc1 8:$ifidx_nc2" > /sys/bus/netdevsim/link_device
+		echo "8:$ifidx_nc1" > /sys/bus/netdevsim/unlink_device
+		exec 8<&-
 	fi
 fi
 

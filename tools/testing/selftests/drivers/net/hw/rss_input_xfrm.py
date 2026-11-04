@@ -111,7 +111,7 @@ def test_rss_input_xfrm_ipv6(cfg):
 
 
 def main() -> None:
-    with NetDrvEpEnv(__file__, nsim_test=False) as cfg:
+    with NetDrvEpEnv(__file__) as cfg:
         cfg.ethnl = EthtoolFamily()
         cfg.netdevnl = NetdevFamily()
 

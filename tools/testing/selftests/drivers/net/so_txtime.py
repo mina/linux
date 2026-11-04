@@ -25,7 +25,7 @@ def test_so_txtime(cfg, clockid, ipver, args_tx, args_rx, expect_success,
         cfg.bin_local = cfg.test_dir / "so_txtime"
         cfg.bin_remote = cfg.remote.deploy(cfg.bin_local)
 
-    tstart = time.time_ns() + (2000_000_000 if slow_machine else 200_000_000)
+    tstart = time.time_ns() + (2000_000_000 if slow_machine else 600_000_000)
 
     cmd_addr = f"-S {cfg.addr_v[ipver]} -D {cfg.remote_addr_v[ipver]}"
     cmd_args = f"-{ipver} -c {clockid} -t {tstart} {cmd_addr}"

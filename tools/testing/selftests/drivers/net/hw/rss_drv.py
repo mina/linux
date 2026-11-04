@@ -170,17 +170,17 @@ def resize_below_user_size_reject(cfg, create_context):
 
     _require_dynamic_indir_size(cfg, ch_max)
 
-    ctx_id = _maybe_create_context(cfg, create_context)
-
     # Measure the table size at max channels
-    rss = _get_rss(cfg, context=ctx_id)
+    rss = _get_rss(cfg)
     big_size = len(rss['rss-indirection-table'])
 
     # Measure the table size at reduced channels
     ethtool(f"-L {cfg.ifname} combined 4")
-    rss = _get_rss(cfg, context=ctx_id)
+    rss = _get_rss(cfg)
     small_size = len(rss['rss-indirection-table'])
     ethtool(f"-L {cfg.ifname} combined {ch_max}")
+
+    ctx_id = _maybe_create_context(cfg, create_context)
 
     if small_size >= big_size:
         raise KsftSkipEx("Table did not shrink at reduced channels")
