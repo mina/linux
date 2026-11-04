@@ -213,7 +213,7 @@ bool time_bench_calc_stats(struct time_bench_record *rec)
  * execution time stats.  The function being called/timed is assumed
  * to perform a tight loop, and update the timing record struct.
  */
-bool time_bench_loop(uint32_t loops, int step, char *txt, void *data,
+bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		     int (*func)(struct time_bench_record *record, void *data))
 {
 	struct time_bench_record rec;
