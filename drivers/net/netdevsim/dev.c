@@ -19,6 +19,7 @@
 #include <linux/device.h>
 #include <linux/etherdevice.h>
 #include <linux/hex.h>
+#include <linux/hrtimer.h>
 #include <linux/inet.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -26,15 +27,391 @@
 #include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/rtnetlink.h>
+#include <linux/skbuff.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <net/devlink.h>
 #include <net/ip.h>
+#include <net/pkt_sched.h>
 #include <net/flow_offload.h>
 #include <uapi/linux/devlink.h>
 #include <uapi/linux/ip.h>
 #include <uapi/linux/udp.h>
 
 #include "netdevsim.h"
+
+struct nsim_vf_netdev_priv {
+	struct nsim_dev *nsim_dev;
+	unsigned int vf_id;
+	struct sk_buff_head tx_q[DEVLINK_RATE_TCS_MAX];
+	ktime_t next_tx_tc[DEVLINK_RATE_TCS_MAX];
+	u64 deficit[DEVLINK_RATE_TCS_MAX];
+	struct hrtimer tx_timer;
+	spinlock_t tx_lock; /* protects tx_q, next_tx_tc, deficit, rr_tc */
+	ktime_t next_tx;
+	int rr_tc;
+	bool tc_mapped;
+	bool draining;
+};
+
+static struct nsim_dev_port *
+__nsim_dev_port_lookup(struct nsim_dev *nsim_dev, enum nsim_dev_port_type type,
+		       unsigned int port_index);
+
+static void nsim_vf_tx_drain(struct nsim_vf_netdev_priv *vp)
+{
+	struct nsim_dev *nsim_dev = vp->nsim_dev;
+	struct netdevsim *rep_ns;
+	struct nsim_dev_port *vf_port = NULL;
+	struct net_device *rep_dev = NULL;
+	ktime_t now;
+
+	local_bh_disable();
+	rcu_read_lock();
+	rep_ns = READ_ONCE(nsim_dev->vf_rep[vp->vf_id]);
+	if (rep_ns) {
+		vf_port = rep_ns->nsim_dev_port;
+		rep_dev = rep_ns->netdev;
+	}
+
+	spin_lock(&vp->tx_lock);
+	if (vp->draining) {
+		spin_unlock(&vp->tx_lock);
+		rcu_read_unlock();
+		local_bh_enable();
+		return;
+	}
+	vp->draining = true;
+
+	for (;;) {
+		u16 rate_mbps = nsim_dev->vfconfigs[vp->vf_id].max_tx_rate;
+		struct sk_buff *skb = NULL;
+		bool any_queued = false;
+		u32 sum_tc_bw = 0;
+		int i;
+
+		for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++) {
+			if (!skb_queue_empty(&vp->tx_q[i])) {
+				any_queued = true;
+				break;
+			}
+		}
+		if (!any_queued)
+			break;
+
+		if (vf_port && vp->tc_mapped) {
+			for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++)
+				sum_tc_bw += vf_port->tc_bw[i];
+		}
+
+		now = ktime_get();
+		if (sum_tc_bw > 0 && rate_mbps > 0) {
+			ktime_t earliest = KTIME_MAX;
+			int chosen_tc = -1;
+
+			for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++) {
+				int tc = (vp->rr_tc + i) % DEVLINK_RATE_TCS_MAX;
+
+				if (skb_queue_empty(&vp->tx_q[tc]))
+					continue;
+				if (!ktime_before(now, vp->next_tx_tc[tc])) {
+					chosen_tc = tc;
+					break;
+				}
+				if (ktime_before(vp->next_tx_tc[tc], earliest))
+					earliest = vp->next_tx_tc[tc];
+			}
+
+			if (chosen_tc < 0) {
+				hrtimer_start(&vp->tx_timer,
+					      ktime_sub(earliest, now),
+					      HRTIMER_MODE_REL_PINNED_SOFT);
+				break;
+			}
+
+			skb = __skb_dequeue(&vp->tx_q[chosen_tc]);
+			vp->rr_tc = (chosen_tc + 1) % DEVLINK_RATE_TCS_MAX;
+			if (skb) {
+				u32 bw = vf_port->tc_bw[chosen_tc];
+				u32 tc_rate = max_t(u32, 1,
+						    (u32)rate_mbps * bw / sum_tc_bw);
+				u64 delay_ns = div_u64((u64)skb->len * 8000ULL,
+						       tc_rate);
+				ktime_t min_tx = ktime_sub_ns(now, 20000000ULL);
+
+				if (ktime_before(vp->next_tx_tc[chosen_tc], min_tx))
+					vp->next_tx_tc[chosen_tc] = min_tx;
+				vp->next_tx_tc[chosen_tc] =
+					ktime_add_ns(vp->next_tx_tc[chosen_tc],
+						     delay_ns);
+			}
+		} else {
+			if (rate_mbps > 0 && ktime_before(now, vp->next_tx)) {
+				hrtimer_start(&vp->tx_timer,
+					      ktime_sub(vp->next_tx, now),
+					      HRTIMER_MODE_REL_PINNED_SOFT);
+				break;
+			}
+
+			for (i = 0; i < DEVLINK_RATE_TCS_MAX; i++) {
+				int tc = (vp->rr_tc + i) % DEVLINK_RATE_TCS_MAX;
+
+				if (!skb_queue_empty(&vp->tx_q[tc])) {
+					skb = __skb_dequeue(&vp->tx_q[tc]);
+					vp->rr_tc = (tc + 1) % DEVLINK_RATE_TCS_MAX;
+					break;
+				}
+			}
+
+			if (skb && rate_mbps > 0) {
+				u64 delay_ns = div_u64((u64)skb->len * 8000ULL,
+						       rate_mbps);
+				ktime_t min_tx = ktime_sub_ns(now, 20000000ULL);
+
+				if (ktime_before(vp->next_tx, min_tx))
+					vp->next_tx = min_tx;
+				vp->next_tx = ktime_add_ns(vp->next_tx, delay_ns);
+			}
+		}
+
+		if (!skb)
+			break;
+
+		spin_unlock(&vp->tx_lock);
+
+		skb_orphan(skb);
+		if (rep_dev) {
+			if (__dev_forward_skb(rep_dev, skb) == NET_RX_SUCCESS)
+				netif_receive_skb(skb);
+		} else {
+			kfree_skb(skb);
+		}
+
+		spin_lock(&vp->tx_lock);
+	}
+	vp->draining = false;
+	spin_unlock(&vp->tx_lock);
+	rcu_read_unlock();
+	local_bh_enable();
+}
+
+static enum hrtimer_restart nsim_vf_tx_timer_fn(struct hrtimer *timer)
+{
+	struct nsim_vf_netdev_priv *vp = container_of(timer,
+						      struct nsim_vf_netdev_priv,
+						      tx_timer);
+
+	nsim_vf_tx_drain(vp);
+	return HRTIMER_NORESTART;
+}
+
+static netdev_tx_t nsim_vf_netdev_xmit(struct sk_buff *skb,
+				       struct net_device *dev)
+{
+	struct nsim_vf_netdev_priv *vp = netdev_priv(dev);
+	int tc = 0;
+
+	skb_tx_timestamp(skb);
+
+	if (vp->tc_mapped) {
+		if (skb_vlan_tag_present(skb)) {
+			u8 pcp = (skb_vlan_tag_get(skb) & VLAN_PRIO_MASK) >>
+				 VLAN_PRIO_SHIFT;
+
+			tc = pcp % DEVLINK_RATE_TCS_MAX;
+		} else {
+			tc = netdev_get_prio_tc_map(dev, skb->priority);
+		}
+		if (tc < 0 || tc >= DEVLINK_RATE_TCS_MAX)
+			tc = skb_get_queue_mapping(skb) % DEVLINK_RATE_TCS_MAX;
+	} else {
+		tc = 0;
+	}
+
+	spin_lock_bh(&vp->tx_lock);
+	if (skb_queue_len(&vp->tx_q[tc]) < 65536)
+		__skb_queue_tail(&vp->tx_q[tc], skb);
+	else
+		kfree_skb(skb);
+	spin_unlock_bh(&vp->tx_lock);
+
+	nsim_vf_tx_drain(vp);
+	return NETDEV_TX_OK;
+}
+
+static int nsim_vf_netdev_setup_tc(struct net_device *dev,
+				   enum tc_setup_type type, void *type_data)
+{
+	struct nsim_vf_netdev_priv *vp = netdev_priv(dev);
+	struct tc_mqprio_qopt_offload *mqprio = type_data;
+	int i;
+
+	if (type == TC_QUERY_CAPS) {
+		struct tc_query_caps_base *base = type_data;
+
+		if (base->type == TC_SETUP_QDISC_MQPRIO) {
+			struct tc_mqprio_caps *caps = base->caps;
+
+			caps->validate_queue_counts = false;
+			return 0;
+		}
+		return -EOPNOTSUPP;
+	}
+
+	if (type != TC_SETUP_QDISC_MQPRIO)
+		return -EOPNOTSUPP;
+
+	if (!mqprio->qopt.num_tc) {
+		vp->tc_mapped = false;
+		netdev_reset_tc(dev);
+		return 0;
+	}
+
+	if (mqprio->qopt.num_tc > DEVLINK_RATE_TCS_MAX)
+		return -EINVAL;
+
+	netdev_set_num_tc(dev, mqprio->qopt.num_tc);
+	for (i = 0; i < mqprio->qopt.num_tc; i++) {
+		u16 count = mqprio->qopt.count[i] ?: 1;
+		u16 offset = mqprio->qopt.offset[i] ?: i;
+
+		netdev_set_tc_queue(dev, i, count, offset);
+	}
+	for (i = 0; i < TC_BITMASK + 1; i++)
+		netdev_set_prio_tc_map(dev, i, mqprio->qopt.prio_tc_map[i]);
+
+	vp->tc_mapped = true;
+	return 0;
+}
+
+static const struct net_device_ops nsim_vf_netdev_ops = {
+	.ndo_start_xmit	= nsim_vf_netdev_xmit,
+	.ndo_setup_tc	= nsim_vf_netdev_setup_tc,
+};
+
+static void nsim_vf_netdev_setup(struct net_device *dev)
+{
+	ether_setup(dev);
+	dev->netdev_ops = &nsim_vf_netdev_ops;
+	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+	dev->features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX |
+			 NETIF_F_HIGHDMA | NETIF_F_SG | NETIF_F_FRAGLIST |
+			 NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
+			 NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_ROBUST;
+	dev->hw_features |= dev->features;
+	dev->vlan_features |= dev->features &
+			      ~(NETIF_F_HW_VLAN_CTAG_TX |
+				NETIF_F_HW_VLAN_CTAG_RX);
+}
+
+static void nsim_vf_dev_release(struct device *dev)
+{
+	kfree(dev);
+}
+
+static int nsim_vf_devices_create(struct nsim_dev *nsim_dev, unsigned int num_vfs)
+{
+	struct nsim_bus_dev *nsim_bus_dev = nsim_dev->nsim_bus_dev;
+	unsigned int i, q;
+	int err;
+
+	for (i = 0; i < num_vfs; i++) {
+		struct nsim_vf_netdev_priv *vp;
+		struct net_device *ndev;
+		struct device *vdev;
+		char vname[16];
+
+		vdev = kzalloc_obj(*vdev);
+		if (!vdev) {
+			err = -ENOMEM;
+			goto err_cleanup;
+		}
+		device_initialize(vdev);
+		vdev->parent = &nsim_bus_dev->dev;
+		vdev->release = nsim_vf_dev_release;
+		snprintf(vname, sizeof(vname), "virtfn%u", i);
+		dev_set_name(vdev, "%s", vname);
+		err = device_add(vdev);
+		if (err) {
+			put_device(vdev);
+			goto err_cleanup;
+		}
+		nsim_dev->vf_devs[i] = vdev;
+
+		ndev = alloc_netdev_mqs(sizeof(*vp), "eth%d",
+					NET_NAME_UNKNOWN, nsim_vf_netdev_setup,
+					DEVLINK_RATE_TCS_MAX,
+					DEVLINK_RATE_TCS_MAX);
+		if (!ndev) {
+			err = -ENOMEM;
+			goto err_cleanup;
+		}
+		dev_net_set(ndev, nsim_dev_net(nsim_dev));
+		SET_NETDEV_DEV(ndev, vdev);
+		eth_hw_addr_random(ndev);
+
+		vp = netdev_priv(ndev);
+		vp->nsim_dev = nsim_dev;
+		vp->vf_id = i;
+		spin_lock_init(&vp->tx_lock);
+		for (q = 0; q < DEVLINK_RATE_TCS_MAX; q++)
+			skb_queue_head_init(&vp->tx_q[q]);
+		hrtimer_setup(&vp->tx_timer, nsim_vf_tx_timer_fn,
+			      CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED_SOFT);
+
+		err = register_netdev(ndev);
+		if (err) {
+			free_netdev(ndev);
+			goto err_cleanup;
+		}
+		netif_carrier_on(ndev);
+		nsim_dev->vf_netdevs[i] = ndev;
+	}
+	return 0;
+
+err_cleanup:
+	for (i = 0; i < NSIM_BUS_DEV_MAX_VFS; i++) {
+		if (nsim_dev->vf_netdevs[i]) {
+			struct net_device *ndev = nsim_dev->vf_netdevs[i];
+			struct nsim_vf_netdev_priv *vp = netdev_priv(ndev);
+
+			WRITE_ONCE(nsim_dev->vf_netdevs[i], NULL);
+			unregister_netdev(ndev);
+			hrtimer_cancel(&vp->tx_timer);
+			for (q = 0; q < DEVLINK_RATE_TCS_MAX; q++)
+				skb_queue_purge(&vp->tx_q[q]);
+			free_netdev(ndev);
+		}
+		if (nsim_dev->vf_devs[i]) {
+			device_unregister(nsim_dev->vf_devs[i]);
+			nsim_dev->vf_devs[i] = NULL;
+		}
+	}
+	return err;
+}
+
+static void nsim_vf_devices_destroy(struct nsim_dev *nsim_dev)
+{
+	unsigned int i, q;
+
+	for (i = 0; i < NSIM_BUS_DEV_MAX_VFS; i++) {
+		if (nsim_dev->vf_netdevs[i]) {
+			struct net_device *ndev = nsim_dev->vf_netdevs[i];
+			struct nsim_vf_netdev_priv *vp = netdev_priv(ndev);
+
+			WRITE_ONCE(nsim_dev->vf_netdevs[i], NULL);
+			unregister_netdev(ndev);
+			hrtimer_cancel(&vp->tx_timer);
+			for (q = 0; q < DEVLINK_RATE_TCS_MAX; q++)
+				skb_queue_purge(&vp->tx_q[q]);
+			free_netdev(ndev);
+		}
+		if (nsim_dev->vf_devs[i]) {
+			device_unregister(nsim_dev->vf_devs[i]);
+			nsim_dev->vf_devs[i] = NULL;
+		}
+	}
+}
 
 static unsigned int
 nsim_dev_port_index(enum nsim_dev_port_type type, unsigned int port_index)
@@ -1213,9 +1590,12 @@ static int nsim_leaf_tx_max_set(struct devlink_rate *devlink_rate, void *priv,
 }
 
 struct nsim_rate_node {
+	struct list_head list;
 	struct dentry *ddir;
 	struct dentry *rate_parent;
 	char *parent_name;
+	struct nsim_rate_node *parent_node;
+	atomic_t num_children;
 	u16 tx_share;
 	u16 tx_max;
 	u32 tc_bw[DEVLINK_RATE_TCS_MAX];
@@ -1286,6 +1666,7 @@ static int nsim_rate_node_new(struct devlink_rate *node, void **priv,
 						     &nsim_dev_rate_parent_fops);
 
 	nsim_dev_tc_bw_debugfs_init(nsim_node->ddir, nsim_node->tc_bw);
+	list_add_tail(&nsim_node->list, &nsim_dev->rate_node_list);
 
 	*priv = nsim_node;
 	return 0;
@@ -1296,6 +1677,7 @@ static int nsim_rate_node_del(struct devlink_rate *node, void *priv,
 {
 	struct nsim_rate_node *nsim_node = priv;
 
+	list_del(&nsim_node->list);
 	debugfs_remove(nsim_node->rate_parent);
 	debugfs_remove_recursive(nsim_node->ddir);
 	kfree(nsim_node);
@@ -1308,11 +1690,20 @@ static int nsim_rate_leaf_parent_set(struct devlink_rate *child,
 				     struct netlink_ext_ack *extack)
 {
 	struct nsim_dev_port *nsim_dev_port = priv_child;
+	struct nsim_rate_node *parent_node = priv_parent;
 
-	if (parent)
+	if (nsim_dev_port->parent_node)
+		atomic_dec(&nsim_dev_port->parent_node->num_children);
+
+	if (parent) {
 		nsim_dev_port->parent_name = parent->name;
-	else
+		nsim_dev_port->parent_node = parent_node;
+		if (parent_node)
+			atomic_inc(&parent_node->num_children);
+	} else {
 		nsim_dev_port->parent_name = NULL;
+		nsim_dev_port->parent_node = NULL;
+	}
 	return 0;
 }
 
@@ -1322,11 +1713,20 @@ static int nsim_rate_node_parent_set(struct devlink_rate *child,
 				     struct netlink_ext_ack *extack)
 {
 	struct nsim_rate_node *nsim_node = priv_child;
+	struct nsim_rate_node *parent_node = priv_parent;
 
-	if (parent)
+	if (nsim_node->parent_node)
+		atomic_dec(&nsim_node->parent_node->num_children);
+
+	if (parent) {
 		nsim_node->parent_name = parent->name;
-	else
+		nsim_node->parent_node = parent_node;
+		if (parent_node)
+			atomic_inc(&parent_node->num_children);
+	} else {
 		nsim_node->parent_name = NULL;
+		nsim_node->parent_node = NULL;
+	}
 	return 0;
 }
 
@@ -1371,14 +1771,102 @@ static const struct devlink_ops nsim_dev_devlink_ops = {
 	.rate_node_del = nsim_rate_node_del,
 	.rate_leaf_parent_set = nsim_rate_leaf_parent_set,
 	.rate_node_parent_set = nsim_rate_node_parent_set,
+	.supported_cross_device_rate_nodes = true,
 	.trap_drop_counter_get = nsim_dev_devlink_trap_drop_counter_get,
 };
 
 #define NSIM_DEV_MAX_MACS_DEFAULT 32
 #define NSIM_DEV_TEST1_DEFAULT true
 
-static int __nsim_dev_port_add(struct nsim_dev *nsim_dev, enum nsim_dev_port_type type,
-			       unsigned int port_index, u8 perm_addr[ETH_ALEN])
+static int __nsim_dev_port_add_ext(struct nsim_dev *nsim_dev,
+				   enum nsim_dev_port_type type,
+				   unsigned int port_index,
+				   u8 perm_addr[ETH_ALEN],
+				   bool is_split, unsigned int split_parent_idx,
+				   unsigned int split_subport,
+				   unsigned int lanes,
+				   const char *parent_ifname);
+
+static int nsim_dev_port_split(struct devlink *devlink,
+			       struct devlink_port *port,
+			       unsigned int count,
+			       struct netlink_ext_ack *extack)
+{
+	struct nsim_dev *nsim_dev = devlink_priv(devlink);
+	struct nsim_dev_port *nsim_dev_port =
+		container_of(port, struct nsim_dev_port, devlink_port);
+	unsigned int parent_idx = nsim_dev_port->port_index;
+	unsigned int parent_lanes = nsim_dev_port->lanes;
+	char parent_ifname[IFNAMSIZ] = {};
+	unsigned int sub_lanes, i;
+	int err;
+
+	if (!nsim_dev_port_is_pf(nsim_dev_port) ||
+	    nsim_dev_port->is_split_subport || parent_lanes < count)
+		return -EINVAL;
+
+	if (nsim_dev_port->ns && nsim_dev_port->ns->netdev)
+		strscpy(parent_ifname, nsim_dev_port->ns->netdev->name,
+			sizeof(parent_ifname));
+
+	sub_lanes = parent_lanes / count;
+	__nsim_dev_port_del(nsim_dev_port);
+
+	for (i = 0; i < count; i++) {
+		unsigned int idx = (i == 0) ? parent_idx :
+				   (64 + parent_idx * 8 + i);
+
+		err = __nsim_dev_port_add_ext(nsim_dev, NSIM_DEV_PORT_TYPE_PF,
+					      idx, NULL, true, parent_idx, i,
+					      sub_lanes, parent_ifname);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int nsim_dev_port_unsplit(struct devlink *devlink,
+				 struct devlink_port *port,
+				 struct netlink_ext_ack *extack)
+{
+	struct nsim_dev *nsim_dev = devlink_priv(devlink);
+	struct nsim_dev_port *nsim_dev_port =
+		container_of(port, struct nsim_dev_port, devlink_port);
+	char parent_ifname[IFNAMSIZ] = {};
+	struct nsim_dev_port *p, *tmp;
+	unsigned int parent_idx;
+
+	if (!nsim_dev_port->is_split_subport) {
+		NL_SET_ERR_MSG_MOD(extack, "Port is not split");
+		return -EINVAL;
+	}
+
+	parent_idx = nsim_dev_port->split_parent_idx;
+	strscpy(parent_ifname, nsim_dev_port->split_parent_ifname,
+		sizeof(parent_ifname));
+	list_for_each_entry_safe(p, tmp, &nsim_dev->port_list, list) {
+		if (p->is_split_subport && p->split_parent_idx == parent_idx)
+			__nsim_dev_port_del(p);
+	}
+
+	return __nsim_dev_port_add_ext(nsim_dev, NSIM_DEV_PORT_TYPE_PF,
+				       parent_idx, NULL, false, 0, 0, 4,
+				       parent_ifname);
+}
+
+static const struct devlink_port_ops nsim_dev_port_ops = {
+	.port_split = nsim_dev_port_split,
+	.port_unsplit = nsim_dev_port_unsplit,
+};
+
+static int __nsim_dev_port_add_ext(struct nsim_dev *nsim_dev,
+				   enum nsim_dev_port_type type,
+				   unsigned int port_index,
+				   u8 perm_addr[ETH_ALEN],
+				   bool is_split, unsigned int split_parent_idx,
+				   unsigned int split_subport,
+				   unsigned int lanes,
+				   const char *parent_ifname)
 {
 	struct devlink_port_attrs attrs = {};
 	struct nsim_dev_port *nsim_dev_port;
@@ -1393,11 +1881,35 @@ static int __nsim_dev_port_add(struct nsim_dev *nsim_dev, enum nsim_dev_port_typ
 		return -ENOMEM;
 	nsim_dev_port->port_index = nsim_dev_port_index(type, port_index);
 	nsim_dev_port->port_type = type;
+	nsim_dev_port->is_split_subport = is_split;
+	nsim_dev_port->split_parent_idx = split_parent_idx;
+	nsim_dev_port->lanes = lanes;
+	if (parent_ifname && parent_ifname[0]) {
+		strscpy(nsim_dev_port->split_parent_ifname, parent_ifname,
+			sizeof(nsim_dev_port->split_parent_ifname));
+		if (is_split)
+			snprintf(nsim_dev_port->ifname,
+				 sizeof(nsim_dev_port->ifname), "%ss%u",
+				 parent_ifname, split_subport);
+		else
+			strscpy(nsim_dev_port->ifname, parent_ifname,
+				sizeof(nsim_dev_port->ifname));
+	}
 
 	devlink_port = &nsim_dev_port->devlink_port;
 	if (nsim_dev_port_is_pf(nsim_dev_port)) {
 		attrs.flavour = DEVLINK_PORT_FLAVOUR_PHYSICAL;
-		attrs.phys.port_number = port_index + 1;
+		if (is_split) {
+			attrs.phys.port_number = split_parent_idx + 1;
+			attrs.phys.split_subport_number = split_subport;
+			attrs.split = 1;
+			attrs.splittable = 0;
+			attrs.lanes = lanes;
+		} else {
+			attrs.phys.port_number = port_index + 1;
+			attrs.lanes = lanes;
+			attrs.splittable = (lanes > 1) ? 1 : 0;
+		}
 	} else {
 		attrs.flavour = DEVLINK_PORT_FLAVOUR_PCI_VF;
 		attrs.pci_vf.pf = 0;
@@ -1406,8 +1918,10 @@ static int __nsim_dev_port_add(struct nsim_dev *nsim_dev, enum nsim_dev_port_typ
 	memcpy(attrs.switch_id.id, nsim_dev->switch_id.id, nsim_dev->switch_id.id_len);
 	attrs.switch_id.id_len = nsim_dev->switch_id.id_len;
 	devlink_port_attrs_set(devlink_port, &attrs);
-	err = devl_port_register(priv_to_devlink(nsim_dev), devlink_port,
-				 nsim_dev_port->port_index);
+	err = devl_port_register_with_ops(priv_to_devlink(nsim_dev),
+					  devlink_port,
+					  nsim_dev_port->port_index,
+					  &nsim_dev_port_ops);
 	if (err)
 		goto err_port_free;
 
@@ -1442,6 +1956,9 @@ static int __nsim_dev_port_add(struct nsim_dev *nsim_dev, enum nsim_dev_port_typ
 					    nsim_dev_port, NULL);
 		if (err)
 			goto err_nsim_destroy;
+		if (port_index < NSIM_BUS_DEV_MAX_VFS)
+			WRITE_ONCE(nsim_dev->vf_rep[port_index],
+				   nsim_dev_port->ns);
 	}
 
 	list_add(&nsim_dev_port->list, &nsim_dev->port_list);
@@ -1462,13 +1979,30 @@ err_port_free:
 	return err;
 }
 
+static int __nsim_dev_port_add(struct nsim_dev *nsim_dev, enum nsim_dev_port_type type,
+			       unsigned int port_index, u8 perm_addr[ETH_ALEN])
+{
+	unsigned int lanes = (type == NSIM_DEV_PORT_TYPE_PF && port_index == 0) ? 4 : 1;
+
+	return __nsim_dev_port_add_ext(nsim_dev, type, port_index, perm_addr,
+				       false, 0, 0, lanes, NULL);
+}
+
 static void __nsim_dev_port_del(struct nsim_dev_port *nsim_dev_port)
 {
 	struct devlink_port *devlink_port = &nsim_dev_port->devlink_port;
 
 	list_del(&nsim_dev_port->list);
-	if (nsim_dev_port_is_vf(nsim_dev_port))
+	if (nsim_dev_port_is_vf(nsim_dev_port)) {
+		unsigned int vf_id =
+			nsim_dev_port_index_to_vf_index(nsim_dev_port->port_index);
+
+		if (vf_id < NSIM_BUS_DEV_MAX_VFS)
+			WRITE_ONCE(nsim_dev_port->ns->nsim_dev->vf_rep[vf_id],
+				   NULL);
+		synchronize_rcu();
 		devl_rate_leaf_destroy(&nsim_dev_port->devlink_port);
+	}
 	nsim_destroy(nsim_dev_port->ns);
 	nsim_dev_port_debugfs_exit(nsim_dev_port);
 	if (nsim_dev_port_is_pf(nsim_dev_port))
@@ -1570,6 +2104,10 @@ err_dummy_region_exit:
 	return err;
 }
 
+static const struct devlink_ops nsim_shd_devlink_ops = {
+	.supported_cross_device_rate_nodes = true,
+};
+
 int nsim_drv_probe(struct nsim_bus_dev *nsim_bus_dev)
 {
 	struct nsim_dev *nsim_dev;
@@ -1586,6 +2124,7 @@ int nsim_drv_probe(struct nsim_bus_dev *nsim_bus_dev)
 	nsim_dev->switch_id.id_len = sizeof(nsim_dev->switch_id.id);
 	get_random_bytes(nsim_dev->switch_id.id, nsim_dev->switch_id.id_len);
 	INIT_LIST_HEAD(&nsim_dev->port_list);
+	INIT_LIST_HEAD(&nsim_dev->rate_node_list);
 	nsim_dev->fw_update_status = true;
 	nsim_dev->fw_update_overwrite_mask = 0;
 	nsim_dev->fw_update_flash_chunk_time_ms = NSIM_DEV_FLASH_CHUNK_TIME_MS_DEFAULT;
@@ -1605,9 +2144,30 @@ int nsim_drv_probe(struct nsim_bus_dev *nsim_bus_dev)
 		goto err_devlink_unlock;
 	}
 
+	if (nsim_bus_dev->parent_dev_id >= 0) {
+		char shd_id[32];
+
+		snprintf(shd_id, sizeof(shd_id), "nsim_chip_%d",
+			 nsim_bus_dev->parent_dev_id);
+		nsim_dev->parent_devlink = devlink_shd_get(shd_id,
+							   &nsim_shd_devlink_ops,
+							   0,
+							   nsim_bus_dev->dev.driver);
+		if (!nsim_dev->parent_devlink) {
+			err = -ENOMEM;
+			goto err_vfc_free;
+		}
+		err = devl_nested_devlink_set(nsim_dev->parent_devlink, devlink);
+		if (err) {
+			devlink_shd_put(nsim_dev->parent_devlink);
+			nsim_dev->parent_devlink = NULL;
+			goto err_vfc_free;
+		}
+	}
+
 	err = devl_register(devlink);
 	if (err)
-		goto err_vfc_free;
+		goto err_shd_put;
 
 	err = nsim_dev_resources_register(devlink);
 	if (err)
@@ -1684,6 +2244,11 @@ err_resource_unregister:
 	devl_resources_unregister(devlink);
 err_dl_unregister:
 	devl_unregister(devlink);
+err_shd_put:
+	if (nsim_dev->parent_devlink) {
+		devlink_shd_put(nsim_dev->parent_devlink);
+		nsim_dev->parent_devlink = NULL;
+	}
 err_vfc_free:
 	kfree(nsim_dev->vfconfigs);
 err_devlink_unlock:
@@ -1702,6 +2267,7 @@ static void nsim_dev_reload_destroy(struct nsim_dev *nsim_dev)
 	debugfs_remove(nsim_dev->take_snapshot);
 
 	if (nsim_dev_get_vfs(nsim_dev)) {
+		nsim_vf_devices_destroy(nsim_dev);
 		nsim_bus_dev_set_vfs(nsim_dev->nsim_bus_dev, 0);
 		if (nsim_esw_mode_is_switchdev(nsim_dev))
 			nsim_esw_legacy_enable(nsim_dev, NULL);
@@ -1720,6 +2286,7 @@ void nsim_drv_remove(struct nsim_bus_dev *nsim_bus_dev)
 {
 	struct nsim_dev *nsim_dev = dev_get_drvdata(&nsim_bus_dev->dev);
 	struct devlink *devlink = priv_to_devlink(nsim_dev);
+	struct devlink *parent_devlink = nsim_dev->parent_devlink;
 
 	devl_lock(devlink);
 	nsim_dev_reload_destroy(nsim_dev);
@@ -1735,6 +2302,8 @@ void nsim_drv_remove(struct nsim_bus_dev *nsim_bus_dev)
 	mutex_destroy(&nsim_dev->progs_list_lock);
 	devl_unlock(devlink);
 	devlink_free(devlink);
+	if (parent_devlink)
+		devlink_shd_put(parent_devlink);
 	dev_set_drvdata(&nsim_bus_dev->dev, NULL);
 }
 
@@ -1788,6 +2357,8 @@ int nsim_drv_configure_vfs(struct nsim_bus_dev *nsim_bus_dev,
 {
 	struct nsim_dev *nsim_dev = dev_get_drvdata(&nsim_bus_dev->dev);
 	struct devlink *devlink = priv_to_devlink(nsim_dev);
+	struct nsim_dev_port *nsim_dev_port;
+	struct nsim_rate_node *node;
 	int ret = 0;
 
 	devl_lock(devlink);
@@ -1802,11 +2373,37 @@ int nsim_drv_configure_vfs(struct nsim_bus_dev *nsim_bus_dev,
 		goto exit_unlock;
 	}
 
+	if (!num_vfs) {
+		list_for_each_entry(nsim_dev_port, &nsim_dev->port_list, list) {
+			if (nsim_dev_port_is_vf(nsim_dev_port) &&
+			    nsim_dev_port->parent_name) {
+				ret = -EBUSY;
+				goto exit_unlock;
+			}
+		}
+		list_for_each_entry(node, &nsim_dev->rate_node_list, list) {
+			if (atomic_read(&node->num_children) > 0) {
+				ret = -EBUSY;
+				goto exit_unlock;
+			}
+		}
+		nsim_vf_devices_destroy(nsim_dev);
+	}
+
 	nsim_bus_dev_set_vfs(nsim_bus_dev, num_vfs);
+	if (num_vfs) {
+		ret = nsim_vf_devices_create(nsim_dev, num_vfs);
+		if (ret) {
+			nsim_bus_dev_set_vfs(nsim_bus_dev, 0);
+			goto exit_unlock;
+		}
+	}
+
 	if (nsim_esw_mode_is_switchdev(nsim_dev)) {
 		if (num_vfs) {
 			ret = nsim_esw_switchdev_enable(nsim_dev, NULL);
 			if (ret) {
+				nsim_vf_devices_destroy(nsim_dev);
 				nsim_bus_dev_set_vfs(nsim_bus_dev, 0);
 				goto exit_unlock;
 			}

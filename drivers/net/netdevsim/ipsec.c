@@ -3,6 +3,10 @@
 
 #include <crypto/aead.h>
 #include <linux/debugfs.h>
+#include <linux/scatterlist.h>
+#include <linux/udp.h>
+#include <net/esp.h>
+#include <net/gso.h>
 #include <net/xfrm.h>
 
 #include "netdevsim.h"
@@ -221,51 +225,172 @@ static const struct xfrmdev_ops nsim_xfrmdev_ops = {
 	.xdo_dev_state_delete	= nsim_ipsec_del_sa,
 };
 
-bool nsim_ipsec_tx(struct netdevsim *ns, struct sk_buff *skb)
+static bool nsim_ipsec_encrypt_one(struct xfrm_state *xs, struct sk_buff *skb)
+{
+	struct xfrm_offload *xo = xfrm_offload(skb);
+	struct crypto_aead *aead = xs->data;
+	struct aead_request *req;
+	struct ip_esp_hdr *esph;
+	struct scatterlist sg;
+	int ivlen, alen, clen;
+	int esph_off, tailen;
+	u8 iv[16] = {};
+	__be64 seqno;
+	u8 padlen;
+	int err;
+
+	if (!aead || skb_linearize(skb))
+		return false;
+
+	ivlen = crypto_aead_ivsize(aead);
+	alen = crypto_aead_authsize(aead);
+	esph_off = skb_transport_offset(skb);
+	if (skb->len < esph_off + sizeof(*esph) + ivlen + 2 + alen)
+		return false;
+
+	esph = ip_esp_hdr(skb);
+	clen = skb->len - esph_off - sizeof(*esph) - ivlen - alen;
+	padlen = *(skb->data + esph_off + sizeof(*esph) + ivlen + clen - 2);
+	tailen = padlen + 2 + alen;
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+		int csum_off = skb_checksum_start_offset(skb);
+		int inner_end = skb->len - tailen;
+
+		if (inner_end > csum_off &&
+		    csum_off + skb->csum_offset + 2 <= inner_end) {
+			__wsum csum = skb_checksum(skb, csum_off,
+						   inner_end - csum_off, 0);
+			__sum16 sum = csum_fold(csum);
+
+			if (!sum &&
+			    skb->csum_offset == offsetof(struct udphdr, check))
+				sum = CSUM_MANGLED_0;
+			*(__sum16 *)(skb->data + csum_off + skb->csum_offset) =
+				sum;
+		}
+		skb->ip_summed = CHECKSUM_NONE;
+	}
+
+	req = aead_request_alloc(aead, GFP_ATOMIC);
+	if (!req)
+		return false;
+
+	seqno = cpu_to_be64(ntohl(esph->seq_no) + ((u64)xo->seq.hi << 32));
+	memcpy(iv + ivlen - min(ivlen, 8),
+	       (u8 *)&seqno + 8 - min(ivlen, 8), min(ivlen, 8));
+
+	sg_init_one(&sg, esph, sizeof(*esph) + ivlen + clen + alen);
+	aead_request_set_callback(req, 0, NULL, NULL);
+	aead_request_set_crypt(req, &sg, &sg, ivlen + clen, iv);
+	aead_request_set_ad(req, sizeof(*esph));
+
+	err = crypto_aead_encrypt(req);
+	aead_request_free(req);
+	if (err)
+		return false;
+
+	secpath_reset(skb);
+	return true;
+}
+
+struct sk_buff *nsim_ipsec_tx(struct netdevsim *ns, struct sk_buff *skb,
+			      bool do_crypto)
 {
 	struct sec_path *sp = skb_sec_path(skb);
 	struct nsim_ipsec *ipsec = &ns->ipsec;
+	struct xfrm_offload *xo;
 	struct xfrm_state *xs;
 	struct nsim_sa *tsa;
 	u32 sa_idx;
 
+	skb->next = NULL;
+
 	/* do we even need to check this packet? */
 	if (!sp)
-		return true;
+		return skb;
 
 	if (unlikely(!sp->len)) {
 		netdev_err(ns->netdev, "no xfrm state len = %d\n",
 			   sp->len);
-		return false;
+		kfree_skb(skb);
+		return NULL;
 	}
 
 	xs = xfrm_input_state(skb);
 	if (unlikely(!xs)) {
 		netdev_err(ns->netdev, "no xfrm_input_state() xs = %p\n", xs);
-		return false;
+		kfree_skb(skb);
+		return NULL;
 	}
 
 	sa_idx = xs->xso.offload_handle & ~NSIM_IPSEC_VALID;
 	if (unlikely(sa_idx >= NSIM_IPSEC_MAX_SA_COUNT)) {
 		netdev_err(ns->netdev, "bad sa_idx=%d max=%d\n",
 			   sa_idx, NSIM_IPSEC_MAX_SA_COUNT);
-		return false;
+		kfree_skb(skb);
+		return NULL;
 	}
 
 	tsa = &ipsec->sa[sa_idx];
 	if (unlikely(!tsa->used)) {
 		netdev_err(ns->netdev, "unused sa_idx=%d\n", sa_idx);
-		return false;
+		kfree_skb(skb);
+		return NULL;
 	}
 
 	if (xs->id.proto != IPPROTO_ESP && xs->id.proto != IPPROTO_AH) {
 		netdev_err(ns->netdev, "unexpected proto=%d\n", xs->id.proto);
-		return false;
+		kfree_skb(skb);
+		return NULL;
 	}
 
 	ipsec->tx++;
 
-	return true;
+	xo = xfrm_offload(skb);
+	if (!do_crypto || !xo || !(xo->flags & XFRM_XMIT) ||
+	    xs->id.proto != IPPROTO_ESP)
+		return skb;
+
+	if (skb_is_gso(skb)) {
+		struct sk_buff *segs, *seg, *next, *head = NULL, *tail = NULL;
+
+		segs = skb_gso_segment(skb, 0);
+		if (IS_ERR_OR_NULL(segs)) {
+			kfree_skb(skb);
+			return NULL;
+		}
+		consume_skb(skb);
+
+		skb_list_walk_safe(segs, seg, next) {
+			bool again = false;
+
+			skb_mark_not_on_list(seg);
+			xo = xfrm_offload(seg);
+			if (xo)
+				xo->flags &= ~XFRM_XMIT;
+			seg = validate_xmit_xfrm(seg, 0, &again);
+			if (IS_ERR_OR_NULL(seg)) {
+				kfree_skb_list(next);
+				kfree_skb_list(head);
+				return NULL;
+			}
+			seg->next = NULL;
+			if (!head)
+				head = seg;
+			else
+				tail->next = seg;
+			tail = seg;
+		}
+		return head;
+	}
+
+	if (!nsim_ipsec_encrypt_one(xs, skb)) {
+		kfree_skb(skb);
+		return NULL;
+	}
+
+	return skb;
 }
 
 void nsim_ipsec_init(struct netdevsim *ns)
@@ -278,7 +403,14 @@ void nsim_ipsec_init(struct netdevsim *ns)
 
 	ns->netdev->features |= NSIM_ESP_FEATURES;
 	ns->netdev->hw_features |= NSIM_ESP_FEATURES;
-	ns->netdev->hw_enc_features |= NSIM_ESP_FEATURES;
+	ns->netdev->hw_enc_features |= NSIM_ESP_FEATURES |
+				       NETIF_F_SG |
+				       NETIF_F_HW_CSUM |
+				       NETIF_F_TSO |
+				       NETIF_F_TSO6 |
+				       NETIF_F_GSO_UDP_L4 |
+				       NETIF_F_GSO_UDP_TUNNEL |
+				       NETIF_F_GSO_UDP_TUNNEL_CSUM;
 
 	ns->ipsec.pfile = debugfs_create_file("ipsec", 0400,
 					      ns->nsim_dev_port->ddir, ns,

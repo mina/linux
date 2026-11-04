@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/debugfs.h>
+#include <linux/if_arp.h>
+#include <linux/if_vlan.h>
 
 #include "netdevsim.h"
 
@@ -29,14 +31,16 @@ static void nsim_dev_hwstats_traffic_bump(struct nsim_dev_hwstats *hwstats,
 	if (WARN_ON(!hwsdev_list))
 		return;
 
+	spin_lock_bh(&hwstats->stats_lock);
 	list_for_each_entry(hwsdev, hwsdev_list, list) {
-		if (hwsdev->enabled) {
+		if (hwsdev->enabled && !hwsdev->auto_tracked) {
 			hwsdev->stats.rx_packets += 1;
 			hwsdev->stats.tx_packets += 2;
 			hwsdev->stats.rx_bytes += 100;
 			hwsdev->stats.tx_bytes += 300;
 		}
 	}
+	spin_unlock_bh(&hwstats->stats_lock);
 }
 
 static void nsim_dev_hwstats_traffic_work(struct work_struct *work)
@@ -79,18 +83,28 @@ static int nsim_dev_hwsdev_enable(struct nsim_dev_hwstats_netdev *hwsdev,
 	return 0;
 }
 
-static void nsim_dev_hwsdev_disable(struct nsim_dev_hwstats_netdev *hwsdev)
+static void nsim_dev_hwsdev_disable(struct nsim_dev_hwstats *hwstats,
+				    struct nsim_dev_hwstats_netdev *hwsdev)
 {
+	spin_lock_bh(&hwstats->stats_lock);
 	hwsdev->enabled = false;
 	memset(&hwsdev->stats, 0, sizeof(hwsdev->stats));
+	spin_unlock_bh(&hwstats->stats_lock);
 }
 
 static int
-nsim_dev_hwsdev_report_delta(struct nsim_dev_hwstats_netdev *hwsdev,
+nsim_dev_hwsdev_report_delta(struct nsim_dev_hwstats *hwstats,
+			     struct nsim_dev_hwstats_netdev *hwsdev,
 			     struct netdev_notifier_offload_xstats_info *info)
 {
-	netdev_offload_xstats_report_delta(info->report_delta, &hwsdev->stats);
+	struct rtnl_hw_stats64 snap;
+
+	spin_lock_bh(&hwstats->stats_lock);
+	snap = hwsdev->stats;
 	memset(&hwsdev->stats, 0, sizeof(hwsdev->stats));
+	spin_unlock_bh(&hwstats->stats_lock);
+
+	netdev_offload_xstats_report_delta(info->report_delta, &snap);
 	return 0;
 }
 
@@ -102,10 +116,47 @@ nsim_dev_hwsdev_report_used(struct nsim_dev_hwstats_netdev *hwsdev,
 		netdev_offload_xstats_report_used(info->report_used);
 }
 
+static bool nsim_dev_owns_l3_dev(struct nsim_dev *nsim_dev,
+				 struct net_device *dev)
+{
+	struct net_device *lower;
+	struct list_head *iter;
+
+	if (netdev_is_nsim(dev)) {
+		struct netdevsim *ns = netdev_priv(dev);
+
+		return ns->nsim_dev == nsim_dev;
+	}
+
+	netdev_for_each_lower_dev(dev, lower, iter) {
+		if (netdev_is_nsim(lower)) {
+			struct netdevsim *ns = netdev_priv(lower);
+
+			if (ns->nsim_dev == nsim_dev)
+				return true;
+		}
+	}
+
+	if ((dev->type == ARPHRD_IPGRE || dev->type == ARPHRD_IP6GRE) &&
+	    !list_empty(&nsim_dev->port_list)) {
+		struct nsim_dev_port *first_port;
+
+		first_port = list_first_entry(&nsim_dev->port_list,
+					      struct nsim_dev_port, list);
+		if (first_port->ns &&
+		    netif_running(first_port->ns->netdev))
+			return true;
+	}
+
+	return false;
+}
+
 static int nsim_dev_hwstats_event_off_xstats(struct nsim_dev_hwstats *hwstats,
 					     struct net_device *dev,
 					     unsigned long event, void *ptr)
 {
+	struct nsim_dev *nsim_dev = container_of(hwstats, struct nsim_dev,
+						 hwstats);
 	struct netdev_notifier_offload_xstats_info *info;
 	struct nsim_dev_hwstats_netdev *hwsdev;
 	struct list_head *hwsdev_list;
@@ -119,6 +170,18 @@ static int nsim_dev_hwstats_event_off_xstats(struct nsim_dev_hwstats *hwstats,
 	mutex_lock(&hwstats->hwsdev_list_lock);
 
 	hwsdev = nsim_dev_hwslist_find_hwsdev(hwsdev_list, dev->ifindex);
+	if (!hwsdev && event == NETDEV_OFFLOAD_XSTATS_ENABLE &&
+	    nsim_dev_owns_l3_dev(nsim_dev, dev)) {
+		hwsdev = kzalloc_obj(*hwsdev);
+		if (hwsdev) {
+			netdev_hold(dev, NULL, GFP_KERNEL);
+			hwsdev->netdev = dev;
+			hwsdev->auto_tracked = true;
+			spin_lock_bh(&hwstats->stats_lock);
+			list_add_tail(&hwsdev->list, hwsdev_list);
+			spin_unlock_bh(&hwstats->stats_lock);
+		}
+	}
 	if (!hwsdev)
 		goto out;
 
@@ -127,13 +190,20 @@ static int nsim_dev_hwstats_event_off_xstats(struct nsim_dev_hwstats *hwstats,
 		err = nsim_dev_hwsdev_enable(hwsdev, info->info.extack);
 		break;
 	case NETDEV_OFFLOAD_XSTATS_DISABLE:
-		nsim_dev_hwsdev_disable(hwsdev);
+		nsim_dev_hwsdev_disable(hwstats, hwsdev);
+		if (hwsdev->auto_tracked) {
+			spin_lock_bh(&hwstats->stats_lock);
+			list_del(&hwsdev->list);
+			spin_unlock_bh(&hwstats->stats_lock);
+			netdev_put(hwsdev->netdev, NULL);
+			kfree(hwsdev);
+		}
 		break;
 	case NETDEV_OFFLOAD_XSTATS_REPORT_USED:
 		nsim_dev_hwsdev_report_used(hwsdev, info);
 		break;
 	case NETDEV_OFFLOAD_XSTATS_REPORT_DELTA:
-		err = nsim_dev_hwsdev_report_delta(hwsdev, info);
+		err = nsim_dev_hwsdev_report_delta(hwstats, hwsdev, info);
 		break;
 	}
 
@@ -164,7 +234,9 @@ __nsim_dev_hwstats_event_unregister(struct nsim_dev_hwstats *hwstats,
 	if (!hwsdev)
 		return;
 
+	spin_lock_bh(&hwstats->stats_lock);
 	list_del(&hwsdev->list);
+	spin_unlock_bh(&hwstats->stats_lock);
 	nsim_dev_hwsdev_fini(hwsdev);
 }
 
@@ -245,7 +317,9 @@ nsim_dev_hwstats_enable_ifindex(struct nsim_dev_hwstats *hwstats,
 	}
 
 	hwsdev->netdev = netdev;
+	spin_lock_bh(&hwstats->stats_lock);
 	list_add_tail(&hwsdev->list, hwsdev_list);
+	spin_unlock_bh(&hwstats->stats_lock);
 	mutex_unlock(&hwstats->hwsdev_list_lock);
 
 	if (netdev_offload_xstats_enabled(netdev, type)) {
@@ -276,8 +350,11 @@ nsim_dev_hwstats_disable_ifindex(struct nsim_dev_hwstats *hwstats,
 	rtnl_lock();
 	mutex_lock(&hwstats->hwsdev_list_lock);
 	hwsdev = nsim_dev_hwslist_find_hwsdev(hwsdev_list, ifindex);
-	if (hwsdev)
+	if (hwsdev) {
+		spin_lock_bh(&hwstats->stats_lock);
 		list_del(&hwsdev->list);
+		spin_unlock_bh(&hwstats->stats_lock);
+	}
 	mutex_unlock(&hwstats->hwsdev_list_lock);
 
 	if (!hwsdev) {
@@ -401,6 +478,34 @@ static const struct nsim_dev_hwstats_fops nsim_dev_hwstats_l3_fail_fops =
 
 #undef NSIM_DEV_HWSTATS_FOPS
 
+void nsim_dev_hwstats_record(struct net_device *nsim_netdev, unsigned int len,
+			     bool is_tx)
+{
+	struct netdevsim *ns = netdev_priv(nsim_netdev);
+	struct nsim_dev_hwstats *hwstats = &ns->nsim_dev->hwstats;
+	struct nsim_dev_hwstats_netdev *hwsdev;
+
+	spin_lock_bh(&hwstats->stats_lock);
+	list_for_each_entry(hwsdev, &hwstats->l3_list, list) {
+		if (!hwsdev->enabled || !hwsdev->auto_tracked)
+			continue;
+		if (hwsdev->netdev == nsim_netdev ||
+		    (is_vlan_dev(hwsdev->netdev) &&
+		     vlan_dev_real_dev(hwsdev->netdev) == nsim_netdev) ||
+		    hwsdev->netdev->type == ARPHRD_IPGRE ||
+		    hwsdev->netdev->type == ARPHRD_IP6GRE) {
+			if (is_tx) {
+				hwsdev->stats.tx_packets++;
+				hwsdev->stats.tx_bytes += len;
+			} else {
+				hwsdev->stats.rx_packets++;
+				hwsdev->stats.rx_bytes += len;
+			}
+		}
+	}
+	spin_unlock_bh(&hwstats->stats_lock);
+}
+
 int nsim_dev_hwstats_init(struct nsim_dev *nsim_dev)
 {
 	struct nsim_dev_hwstats *hwstats = &nsim_dev->hwstats;
@@ -408,6 +513,7 @@ int nsim_dev_hwstats_init(struct nsim_dev *nsim_dev)
 	int err;
 
 	mutex_init(&hwstats->hwsdev_list_lock);
+	spin_lock_init(&hwstats->stats_lock);
 	INIT_LIST_HEAD(&hwstats->l3_list);
 
 	hwstats->netdevice_nb.notifier_call = nsim_dev_netdevice_event;

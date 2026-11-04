@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/rtnetlink.h>
+#include <net/netdev_queues.h>
 #include <net/pkt_cls.h>
 
 #include "netdevsim.h"
@@ -303,7 +304,9 @@ static const struct bpf_prog_offload_ops nsim_bpf_dev_ops = {
 
 static int nsim_setup_prog_checks(struct netdevsim *ns, struct netdev_bpf *bpf)
 {
-	if (bpf->prog && bpf->prog->aux->offload) {
+	unsigned int i;
+
+	if (bpf->prog && bpf_prog_is_offloaded(bpf->prog->aux)) {
 		NSIM_EA(bpf->extack, "attempt to load offloaded prog to drv");
 		return -EINVAL;
 	}
@@ -311,6 +314,15 @@ static int nsim_setup_prog_checks(struct netdevsim *ns, struct netdev_bpf *bpf)
 	    ns->netdev->mtu > NSIM_XDP_MAX_MTU) {
 		NSIM_EA(bpf->extack, "MTU too large w/ XDP enabled");
 		return -EINVAL;
+	}
+	if (bpf->prog) {
+		for (i = 0; i < ns->netdev->real_num_rx_queues; i++) {
+			if (netif_rxq_has_unreadable_mp(ns->netdev, i)) {
+				NSIM_EA(bpf->extack,
+					"unreadable netmem active on RX queue");
+				return -EBUSY;
+			}
+		}
 	}
 	return 0;
 }
@@ -556,6 +568,49 @@ static void nsim_bpf_map_free(struct bpf_offloaded_map *offmap)
 	kfree(nmap);
 }
 
+static int nsim_bpf_setup_xsk_pool(struct netdevsim *ns,
+				   struct xsk_buff_pool *pool, u16 qid)
+{
+	struct nsim_rq *rq;
+	int err;
+
+	if (qid >= ns->netdev->real_num_rx_queues ||
+	    qid >= ns->netdev->real_num_tx_queues)
+		return -EINVAL;
+
+	rq = ns->rq[qid];
+	if (pool) {
+		err = xsk_pool_dma_map(pool, &ns->nsim_bus_dev->dev,
+				       DMA_ATTR_SKIP_CPU_SYNC);
+		if (err)
+			return err;
+
+		if (netif_running(ns->netdev) &&
+		    xdp_rxq_info_is_reg(&rq->xdp_rxq)) {
+			xdp_rxq_info_unreg_mem_model(&rq->xdp_rxq);
+			xsk_pool_set_rxq_info(pool, &rq->xdp_rxq);
+		}
+		WRITE_ONCE(rq->xsk_pool, pool);
+		if (netif_running(ns->netdev))
+			napi_schedule(&rq->napi);
+	} else {
+		struct xsk_buff_pool *old_pool = rq->xsk_pool;
+
+		WRITE_ONCE(rq->xsk_pool, NULL);
+		if (netif_running(ns->netdev) &&
+		    xdp_rxq_info_is_reg(&rq->xdp_rxq)) {
+			xdp_rxq_info_unreg_mem_model(&rq->xdp_rxq);
+			WARN_ON(xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+							   MEM_TYPE_PAGE_POOL,
+							   rq->page_pool));
+		}
+		if (old_pool)
+			xsk_pool_dma_unmap(old_pool, DMA_ATTR_SKIP_CPU_SYNC);
+	}
+
+	return 0;
+}
+
 int nsim_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 {
 	struct netdevsim *ns = netdev_priv(dev);
@@ -576,6 +631,9 @@ int nsim_bpf(struct net_device *dev, struct netdev_bpf *bpf)
 			return err;
 
 		return nsim_xdp_set_prog(ns, bpf, &ns->xdp_hw);
+	case XDP_SETUP_XSK_POOL:
+		return nsim_bpf_setup_xsk_pool(ns, bpf->xsk.pool,
+					       bpf->xsk.queue_id);
 	case BPF_OFFLOAD_MAP_ALLOC:
 		if (!ns->bpf_map_accept)
 			return -EOPNOTSUPP;

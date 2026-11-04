@@ -154,16 +154,30 @@ static const struct device_type nsim_bus_dev_type = {
 };
 
 static struct nsim_bus_dev *
-nsim_bus_dev_new(unsigned int id, unsigned int port_count, unsigned int num_queues);
+nsim_bus_dev_new(unsigned int id, unsigned int port_count,
+		 unsigned int num_queues, int parent_dev_id);
+
+struct nsim_bus_dev *nsim_bus_dev_find(int id)
+{
+	struct nsim_bus_dev *nsim_bus_dev;
+
+	list_for_each_entry(nsim_bus_dev, &nsim_bus_dev_list, list) {
+		if (nsim_bus_dev->dev.id == id)
+			return nsim_bus_dev;
+	}
+	return NULL;
+}
 
 static ssize_t
 new_device_store(const struct bus_type *bus, const char *buf, size_t count)
 {
 	unsigned int id, port_count, num_queues;
 	struct nsim_bus_dev *nsim_bus_dev;
+	int parent_dev_id = -1;
 	int err;
 
-	err = sscanf(buf, "%u %u %u", &id, &port_count, &num_queues);
+	err = sscanf(buf, "%u %u %u %d", &id, &port_count, &num_queues,
+		     &parent_dev_id);
 	switch (err) {
 	case 1:
 		port_count = 1;
@@ -172,6 +186,7 @@ new_device_store(const struct bus_type *bus, const char *buf, size_t count)
 		num_queues = 1;
 		fallthrough;
 	case 3:
+	case 4:
 		if (id > INT_MAX) {
 			pr_err("Value of \"id\" is too big.\n");
 			return -EINVAL;
@@ -189,7 +204,8 @@ new_device_store(const struct bus_type *bus, const char *buf, size_t count)
 		goto err;
 	}
 
-	nsim_bus_dev = nsim_bus_dev_new(id, port_count, num_queues);
+	nsim_bus_dev = nsim_bus_dev_new(id, port_count, num_queues,
+					parent_dev_id);
 	if (IS_ERR(nsim_bus_dev)) {
 		err = PTR_ERR(nsim_bus_dev);
 		goto err;
@@ -329,13 +345,12 @@ static ssize_t link_device_store(const struct bus_type *bus, const char *buf, si
 	}
 
 	err = 0;
+	nsim_a->require_link = true;
+	nsim_b->require_link = true;
 	rcu_assign_pointer(nsim_a->peer, nsim_b);
 	rcu_assign_pointer(nsim_b->peer, nsim_a);
 
-	if (netif_running(dev_a) && netif_running(dev_b)) {
-		netif_carrier_on(dev_a);
-		netif_carrier_on(dev_b);
-	}
+	nsim_update_carrier(nsim_a);
 
 out_err:
 	put_net(ns_b);
@@ -417,8 +432,7 @@ static int nsim_bus_probe(struct device *dev)
 {
 	struct nsim_bus_dev *nsim_bus_dev = to_nsim_bus_dev(dev);
 
-	if (dma_pci_p2pdma_supported(dev) &&
-	    !dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(64))) {
+	if (!dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(64))) {
 		dev->dma_parms = &nsim_bus_dev->dma_parms;
 		dma_set_max_seg_size(dev, UINT_MAX);
 	} else {
@@ -452,7 +466,8 @@ static const struct bus_type nsim_bus = {
 };
 
 static struct nsim_bus_dev *
-nsim_bus_dev_new(unsigned int id, unsigned int port_count, unsigned int num_queues)
+nsim_bus_dev_new(unsigned int id, unsigned int port_count,
+		 unsigned int num_queues, int parent_dev_id)
 {
 	struct nsim_bus_dev *nsim_bus_dev;
 	int err;
@@ -469,6 +484,7 @@ nsim_bus_dev_new(unsigned int id, unsigned int port_count, unsigned int num_queu
 	nsim_bus_dev->dev.type = &nsim_bus_dev_type;
 	nsim_bus_dev->port_count = port_count;
 	nsim_bus_dev->num_queues = num_queues;
+	nsim_bus_dev->parent_dev_id = parent_dev_id;
 	nsim_bus_dev->initial_net = current->nsproxy->net_ns;
 	/* Disallow using nsim_bus_dev */
 	smp_store_release(&nsim_bus_dev->init, false);

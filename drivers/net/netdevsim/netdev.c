@@ -1,504 +1,1614 @@
 /*
  * Copyright (C) 2017 Netronome Systems, Inc.
  *
- * This software is licensed under the GNU General License Version 2,
+ * This software is dual licensed under the GNU General License Version 2,
  * June 1991 as shown in the file COPYING in the top-level directory of this
- * source tree.
+ * source tree or the BSD 2-Clause License provided below.  You have the
+ * option to license this software under the complete terms of either license.
  *
- * THE COPYRIGHT HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS"
- * WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING,
- * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
- * FOR A PARTICULAR PURPOSE. THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE
- * OF THE PROGRAM IS WITH YOU. SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME
- * THE COST OF ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+ * The BSD 2-Clause License:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      1. Redistributions of source code must retain the above
+ *         copyright notice, this list of conditions and the following
+ *         disclaimer.
+ *
+ *      2. Redistributions in binary form must reproduce the above
+ *         copyright notice, this list of conditions and the following
+ *         disclaimer in the documentation and/or other materials
+ *         provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
-#include <linux/ethtool_netlink.h>
+#include <linux/filter.h>
+#include <linux/if_vlan.h>
+#include <linux/in.h>
+#include <linux/inetdevice.h>
+#include <linux/interrupt.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/net_tstamp.h>
 #include <linux/netdevice.h>
+#include <linux/netpoll.h>
+#include <linux/overflow.h>
+#include <linux/pci.h>
 #include <linux/slab.h>
-#include <net/netdev_queues.h>
-#include <net/netdev_rx_queue.h>
-#include <net/page_pool/helpers.h>
-#include <net/netlink.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <net/gro.h>
+#include <net/ip.h>
+#include <net/ip6_checksum.h>
 #include <net/net_shaper.h>
 #include <net/netdev_lock.h>
+#include <net/netdev_queues.h>
+#include <net/netdev_rx_queue.h>
+#include <net/netmem.h>
+#include <net/page_pool/helpers.h>
 #include <net/pkt_cls.h>
+#include <net/pkt_sched.h>
+#include <net/psp.h>
 #include <net/rtnetlink.h>
+#include <net/sock.h>
+#include <net/switchdev.h>
+#include <net/udp.h>
 #include <net/udp_tunnel.h>
-#include <net/busy_poll.h>
+#include <net/xdp.h>
+#include <net/xdp_sock_drv.h>
+#include <linux/ethtool_netlink.h>
 
 #include "netdevsim.h"
 
 MODULE_IMPORT_NS("NETDEV_INTERNAL");
 
 #define NSIM_RING_SIZE		256
+#define NSIM_HW_GRO_TIMEOUT_NS	(25 * NSEC_PER_MSEC)
 
-static void nsim_start_peer_tx_queue(struct net_device *dev, struct nsim_rq *rq)
+static void nsim_irq_noop(struct irq_data *data)
 {
-	struct netdevsim *ns = netdev_priv(dev);
-	struct net_device *peer_dev;
-	struct netdevsim *peer_ns;
-	struct netdev_queue *txq;
-	u16 idx;
-
-	idx = rq->napi.index;
-	rcu_read_lock();
-	peer_ns = rcu_dereference(ns->peer);
-	if (!peer_ns)
-		goto out;
-
-	/* TX device */
-	peer_dev = peer_ns->netdev;
-	if (dev->real_num_tx_queues != peer_dev->num_rx_queues)
-		goto out;
-
-	txq = netdev_get_tx_queue(peer_dev, idx);
-	if (!netif_tx_queue_stopped(txq))
-		goto out;
-
-	netif_tx_wake_queue(txq);
-out:
-	rcu_read_unlock();
 }
 
-static void nsim_stop_tx_queue(struct net_device *tx_dev,
-			       struct net_device *rx_dev,
-			       struct nsim_rq *rq,
-			       u16 idx)
+static int nsim_irq_set_affinity(struct irq_data *data,
+				 const struct cpumask *dest, bool force)
 {
-	/* If different queues size, do not stop, since it is not
-	 * easy to find which TX queue is mapped here
-	 */
-	if (rx_dev->real_num_tx_queues != tx_dev->num_rx_queues)
+	irq_data_update_effective_affinity(data, dest);
+	return IRQ_SET_MASK_OK;
+}
+
+static struct irq_chip nsim_irq_chip = {
+	.name			= "netdevsim",
+	.irq_startup		= NULL,
+	.irq_shutdown		= nsim_irq_noop,
+	.irq_enable		= nsim_irq_noop,
+	.irq_disable		= nsim_irq_noop,
+	.irq_ack		= nsim_irq_noop,
+	.irq_mask		= nsim_irq_noop,
+	.irq_unmask		= nsim_irq_noop,
+	.irq_set_affinity	= nsim_irq_set_affinity,
+	.flags			= IRQCHIP_SKIP_SET_WAKE,
+};
+
+static irqreturn_t nsim_irq_handler(int irq, void *data)
+{
+	return IRQ_HANDLED;
+}
+
+static void nsim_napi_csd_fn(void *info)
+{
+	struct nsim_rq *rq = info;
+
+	__napi_schedule_irqoff(&rq->napi);
+}
+
+static void nsim_schedule_rq_napi(struct netdevsim *ns, int rxq_idx,
+				  struct nsim_rq *rq)
+{
+	int target_cpu = -1;
+
+	if (!napi_schedule_prep(&rq->napi))
 		return;
 
-	/* rq is the queue on the receive side */
-	netif_subqueue_try_stop(tx_dev, idx,
-				NSIM_RING_SIZE - skb_queue_len(&rq->skb_queue),
-				NSIM_RING_SIZE / 2);
-}
+	if (rq->irq >= 0) {
+		struct irq_data *irqd = irq_get_irq_data(rq->irq);
 
-static int nsim_napi_rx(struct net_device *tx_dev, struct net_device *rx_dev,
-			struct nsim_rq *rq, struct sk_buff *skb)
-{
-	if (skb_queue_len(&rq->skb_queue) > NSIM_RING_SIZE) {
-		dev_kfree_skb_any(skb);
-		return NET_RX_DROP;
+		if (irqd) {
+			const struct cpumask *mask;
+			unsigned int weight;
+
+			mask = irq_data_get_affinity_mask(irqd);
+			weight = cpumask_weight_and(mask, cpu_online_mask);
+			if (weight == 1)
+				target_cpu = cpumask_first_and(mask,
+							       cpu_online_mask);
+		}
 	}
 
-	skb_queue_tail(&rq->skb_queue, skb);
+	if (target_cpu >= 0 && target_cpu < nr_cpu_ids &&
+	    target_cpu != raw_smp_processor_id() && cpu_online(target_cpu)) {
+		if (!smp_call_function_single_async(target_cpu, &rq->csd))
+			return;
+	}
 
-	/* Stop the peer TX queue avoiding dropping packets later */
-	if (skb_queue_len(&rq->skb_queue) >= NSIM_RING_SIZE)
-		nsim_stop_tx_queue(tx_dev, rx_dev, rq,
-				   skb_get_queue_mapping(skb));
+	__napi_schedule(&rq->napi);
+}
 
-	return NET_RX_SUCCESS;
+static int nsim_xmo_rx_timestamp(const struct xdp_md *ctx, u64 *timestamp)
+{
+	const struct xdp_buff *xdp = (const struct xdp_buff *)ctx;
+	struct nsim_rq *rq = container_of(xdp->rxq, struct nsim_rq, xdp_rxq);
+
+	*timestamp = rq->cur_rx_tstamp ?: ktime_get_real_ns();
+	return 0;
+}
+
+static int nsim_xmo_rx_hash(const struct xdp_md *ctx, u32 *hash,
+			    enum xdp_rss_hash_type *rss_type)
+{
+	const struct xdp_buff *xdp = (const struct xdp_buff *)ctx;
+	struct nsim_rq *rq = container_of(xdp->rxq, struct nsim_rq, xdp_rxq);
+
+	*hash = rq->cur_rx_hash ?: 1;
+	*rss_type = rq->cur_rx_hash_type ?: XDP_RSS_TYPE_L4_IPV4_TCP;
+	return 0;
+}
+
+static const struct xdp_metadata_ops nsim_xdp_metadata_ops = {
+	.xmo_rx_timestamp	= nsim_xmo_rx_timestamp,
+	.xmo_rx_hash		= nsim_xmo_rx_hash,
+};
+
+static enum xdp_rss_hash_type nsim_skb_xdp_rss_type(struct sk_buff *skb)
+{
+	struct ethhdr eth_buf, *eth;
+	unsigned int off = ETH_HLEN;
+	__be16 proto;
+
+	eth = skb_header_pointer(skb, 0, sizeof(eth_buf), &eth_buf);
+	if (!eth)
+		return XDP_RSS_TYPE_NONE;
+	proto = eth->h_proto;
+
+	while (eth_type_vlan(proto)) {
+		struct vlan_hdr vhdr, *vp;
+
+		vp = skb_header_pointer(skb, off, sizeof(vhdr), &vhdr);
+		if (!vp)
+			return XDP_RSS_TYPE_NONE;
+		proto = vp->h_vlan_encapsulated_proto;
+		off += sizeof(vhdr);
+	}
+
+	if (proto == htons(ETH_P_IP)) {
+		struct iphdr iph_buf, *iph;
+
+		iph = skb_header_pointer(skb, off, sizeof(iph_buf), &iph_buf);
+		if (!iph)
+			return XDP_RSS_TYPE_L3_IPV4;
+		if (iph->protocol == IPPROTO_TCP)
+			return XDP_RSS_TYPE_L4_IPV4_TCP;
+		if (iph->protocol == IPPROTO_UDP)
+			return XDP_RSS_TYPE_L4_IPV4_UDP;
+		return XDP_RSS_TYPE_L3_IPV4;
+	}
+
+	if (proto == htons(ETH_P_IPV6)) {
+		struct ipv6hdr ip6h_buf, *ip6h;
+
+		ip6h = skb_header_pointer(skb, off, sizeof(ip6h_buf), &ip6h_buf);
+		if (!ip6h)
+			return XDP_RSS_TYPE_L3_IPV6;
+		if (ip6h->nexthdr == IPPROTO_TCP)
+			return XDP_RSS_TYPE_L4_IPV6_TCP;
+		if (ip6h->nexthdr == IPPROTO_UDP)
+			return XDP_RSS_TYPE_L4_IPV6_UDP;
+		return XDP_RSS_TYPE_L3_IPV6;
+	}
+
+	return XDP_RSS_TYPE_NONE;
 }
 
 static bool nsim_skb_has_net_iov(const struct sk_buff *skb)
 {
 	const struct skb_shared_info *shinfo = skb_shinfo(skb);
-	int i;
 
-	if (!skb_frags_readable(skb))
-		return true;
-	for (i = 0; i < shinfo->nr_frags; i++) {
-		if (skb_frag_is_net_iov(&shinfo->frags[i]))
-			return true;
+	return shinfo->nr_frags && skb_frag_is_net_iov(&shinfo->frags[0]);
+}
+
+static struct sk_buff *nsim_devmem_tx_copy(struct sk_buff *skb,
+					   struct net_device *dev)
+{
+	struct sk_buff *nskb;
+	unsigned int headlen;
+	int i, err;
+
+	nskb = __netdev_alloc_skb(dev, skb->len, GFP_ATOMIC);
+	if (!nskb)
+		return NULL;
+
+	skb_copy_header(nskb, skb);
+	nskb->unreadable = 0;
+	headlen = skb_headlen(skb);
+	if (headlen)
+		skb_put_data(nskb, skb->data, headlen);
+
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		unsigned int fsize = skb_frag_size(frag);
+		unsigned int foff = skb_frag_off(frag);
+		void *dst = skb_put(nskb, fsize);
+
+		if (skb_frag_is_net_iov(frag)) {
+			struct net_iov *niov = skb_frag_net_iov(frag);
+
+			err = net_iov_copy_to_buf(niov, foff, dst, fsize);
+			if (err) {
+				dev_kfree_skb_any(nskb);
+				return NULL;
+			}
+		} else {
+			memcpy(dst, skb_frag_address(frag), fsize);
+		}
 	}
+
+	skb_reset_mac_header(nskb);
+	skb_set_network_header(nskb, skb_network_offset(skb));
+	if (skb_transport_header_was_set(skb))
+		skb_set_transport_header(nskb, skb_transport_offset(skb));
+	nskb->ip_summed = skb->ip_summed;
+	nskb->csum_start = skb->csum_start - skb_headroom(skb) +
+			   skb_headroom(nskb);
+	nskb->csum_offset = skb->csum_offset;
+
+	if (skb_is_gso(skb)) {
+		skb_shinfo(nskb)->gso_size = skb_shinfo(skb)->gso_size;
+		skb_shinfo(nskb)->gso_type = skb_shinfo(skb)->gso_type;
+		skb_shinfo(nskb)->gso_segs = skb_shinfo(skb)->gso_segs;
+	}
+
+	return nskb;
+}
+
+static unsigned int nsim_skb_header_len(struct sk_buff *skb,
+					unsigned int hds_thresh)
+{
+	struct ethhdr *eth;
+	__be16 proto;
+	unsigned int off = ETH_HLEN;
+	unsigned int hdr_len = ETH_HLEN;
+
+	if (skb->len < ETH_HLEN)
+		return skb->len;
+
+	eth = (struct ethhdr *)skb->data;
+	proto = eth->h_proto;
+
+	if (eth_type_vlan(proto) && skb->len >= off + sizeof(struct vlan_hdr)) {
+		struct vlan_hdr vhdr, *vp;
+
+		vp = skb_header_pointer(skb, off, sizeof(vhdr), &vhdr);
+		if (vp) {
+			proto = vp->h_vlan_encapsulated_proto;
+			off += sizeof(vhdr);
+			hdr_len = off;
+		}
+	}
+
+	if (proto == htons(ETH_P_IP) && skb->len >= off + sizeof(struct iphdr)) {
+		struct iphdr iph_buf, *iph;
+
+		iph = skb_header_pointer(skb, off, sizeof(iph_buf), &iph_buf);
+		if (iph && iph->ihl >= 5) {
+			unsigned int ihl = iph->ihl * 4;
+
+			hdr_len = off + ihl;
+			if (iph->protocol == IPPROTO_TCP &&
+			    skb->len >= hdr_len + sizeof(struct tcphdr)) {
+				struct tcphdr th_buf, *th;
+
+				th = skb_header_pointer(skb, hdr_len,
+							sizeof(th_buf), &th_buf);
+				if (th && th->doff >= 5)
+					hdr_len += th->doff * 4;
+			} else if (iph->protocol == IPPROTO_UDP &&
+				   skb->len >= hdr_len + sizeof(struct udphdr)) {
+				hdr_len += sizeof(struct udphdr);
+			}
+		}
+	} else if (proto == htons(ETH_P_IPV6) &&
+		   skb->len >= off + sizeof(struct ipv6hdr)) {
+		struct ipv6hdr ip6h_buf, *ip6h;
+
+		ip6h = skb_header_pointer(skb, off, sizeof(ip6h_buf), &ip6h_buf);
+		if (ip6h) {
+			u8 nexthdr = ip6h->nexthdr;
+			__be16 frag_off;
+			int l4_off;
+
+			l4_off = ipv6_skip_exthdr(skb, off + sizeof(*ip6h),
+						  &nexthdr, &frag_off);
+			if (l4_off >= 0) {
+				hdr_len = l4_off;
+				if (nexthdr == IPPROTO_TCP &&
+				    skb->len >= hdr_len + sizeof(struct tcphdr)) {
+					struct tcphdr th_buf, *th;
+
+					th = skb_header_pointer(skb, hdr_len,
+								sizeof(th_buf),
+								&th_buf);
+					if (th && th->doff >= 5)
+						hdr_len += th->doff * 4;
+				} else if (nexthdr == IPPROTO_UDP &&
+					   skb->len >= hdr_len + sizeof(struct udphdr)) {
+					hdr_len += sizeof(struct udphdr);
+				}
+			}
+		}
+	}
+
+	hdr_len = min(hdr_len, skb->len);
+	if (skb->len <= hds_thresh)
+		return skb->len;
+	return hdr_len;
+}
+
+static struct sk_buff *nsim_page_pool_copy_rx(struct netdevsim *ns,
+					      struct nsim_rq *rq,
+					      struct sk_buff *skb)
+{
+	bool unreadable = page_pool_is_unreadable(rq->page_pool);
+	u8 hds_cfg = READ_ONCE(ns->netdev->cfg->hds_config);
+	u32 hds_thresh = READ_ONCE(ns->netdev->cfg->hds_thresh);
+	unsigned int hdr_len, payload_len, copied = 0;
+	struct sk_buff *nskb;
+	int frag_idx = 0;
+
+	if (!unreadable && hds_cfg == ETHTOOL_TCP_DATA_SPLIT_DISABLED)
+		hdr_len = 0;
+	else
+		hdr_len = nsim_skb_header_len(skb, hds_thresh);
+
+	payload_len = skb->len - hdr_len;
+
+	nskb = __netdev_alloc_skb(ns->netdev, max(hdr_len, 64U), GFP_ATOMIC);
+	if (!nskb)
+		return NULL;
+	skb_mark_for_recycle(nskb);
+
+	if (hdr_len)
+		skb_copy_bits(skb, 0, skb_put(nskb, hdr_len), hdr_len);
+
+	while (copied < payload_len && frag_idx < MAX_SKB_FRAGS) {
+		unsigned int chunk_max = PAGE_SIZE << rq->page_pool->p.order;
+		unsigned int todo = min(payload_len - copied, chunk_max);
+		netmem_ref netmem;
+
+		netmem = page_pool_dev_alloc_netmems(rq->page_pool);
+		if (!netmem) {
+			WRITE_ONCE(rq->alloc_fail, rq->alloc_fail + 1);
+			dev_kfree_skb_any(nskb);
+			return NULL;
+		}
+
+		if (netmem_is_net_iov(netmem)) {
+			struct net_iov *niov = netmem_to_net_iov(netmem);
+			void *tmp = kmalloc(todo, GFP_ATOMIC);
+			int err;
+
+			if (!tmp) {
+				page_pool_put_full_netmem(rq->page_pool, netmem,
+							  true);
+				dev_kfree_skb_any(nskb);
+				return NULL;
+			}
+			skb_copy_bits(skb, hdr_len + copied, tmp, todo);
+			err = net_iov_copy_from_buf(niov, 0, tmp, todo);
+			kfree(tmp);
+			if (err) {
+				page_pool_put_full_netmem(rq->page_pool, netmem,
+							  true);
+				dev_kfree_skb_any(nskb);
+				return NULL;
+			}
+		} else {
+			struct page *page = netmem_to_page(netmem);
+
+			skb_copy_bits(skb, hdr_len + copied,
+				      page_address(page), todo);
+		}
+
+		skb_add_rx_frag_netmem(nskb, frag_idx++, netmem, 0, todo,
+				       chunk_max);
+		copied += todo;
+	}
+
+	if (copied < payload_len) {
+		dev_kfree_skb_any(nskb);
+		return NULL;
+	}
+
+	return nskb;
+}
+
+static void nsim_tx_csum_complete(struct sk_buff *skb)
+{
+	bool is_udp;
+
+	if (skb->ip_summed != CHECKSUM_PARTIAL)
+		return;
+
+	is_udp = (skb->csum_offset == offsetof(struct udphdr, check));
+	if (skb_checksum_help(skb))
+		return;
+
+	if (is_udp) {
+		__sum16 *csum = (__sum16 *)(skb_checksum_start(skb) +
+					    skb->csum_offset);
+
+		if (!*csum)
+			*csum = CSUM_MANGLED_0;
+	}
+}
+
+static bool nsim_rx_csum_valid(struct sk_buff *skb)
+{
+	__be16 proto = skb->protocol;
+	unsigned int off = 0;
+
+	while (eth_type_vlan(proto)) {
+		const struct vlan_hdr *vh;
+
+		if (!pskb_may_pull(skb, off + sizeof(*vh)))
+			return false;
+		vh = (const struct vlan_hdr *)(skb->data + off);
+		proto = vh->h_vlan_encapsulated_proto;
+		off += sizeof(*vh);
+	}
+
+	if (proto == htons(ETH_P_IP)) {
+		const struct iphdr *iph;
+		unsigned int ihl, tot_len, l4_off, l4_len;
+		__wsum csum;
+
+		if (!pskb_may_pull(skb, off + sizeof(*iph)))
+			return false;
+		iph = (const struct iphdr *)(skb->data + off);
+		if (iph->version != 4 || iph->ihl < 5)
+			return false;
+		ihl = iph->ihl * 4;
+		if (!pskb_may_pull(skb, off + ihl))
+			return false;
+		iph = (const struct iphdr *)(skb->data + off);
+		if (ip_fast_csum((const u8 *)iph, iph->ihl) != 0)
+			return false;
+		if (ip_is_fragment(iph))
+			return false;
+
+		tot_len = ntohs(iph->tot_len);
+		if (tot_len < ihl || off + tot_len > skb->len)
+			return false;
+		l4_off = off + ihl;
+		l4_len = tot_len - ihl;
+
+		if (iph->protocol == IPPROTO_TCP) {
+			if (l4_len < sizeof(struct tcphdr))
+				return false;
+			csum = skb_checksum(skb, l4_off, l4_len, 0);
+			return csum_tcpudp_magic(iph->saddr, iph->daddr,
+						 l4_len, IPPROTO_TCP, csum) == 0;
+		}
+		if (iph->protocol == IPPROTO_UDP) {
+			const struct udphdr *uh;
+
+			if (l4_len < sizeof(struct udphdr) ||
+			    !pskb_may_pull(skb, l4_off + sizeof(struct udphdr)))
+				return false;
+			uh = (const struct udphdr *)(skb->data + l4_off);
+			if (!uh->check)
+				return false;
+			iph = (const struct iphdr *)(skb->data + off);
+			csum = skb_checksum(skb, l4_off, l4_len, 0);
+			return csum_tcpudp_magic(iph->saddr, iph->daddr,
+						 l4_len, IPPROTO_UDP, csum) == 0;
+		}
+		return false;
+	}
+
+	if (proto == htons(ETH_P_IPV6)) {
+		const struct ipv6hdr *ip6h;
+		unsigned int payload_len, l4_off;
+		u8 nexthdr;
+		__wsum csum;
+
+		if (!pskb_may_pull(skb, off + sizeof(*ip6h)))
+			return false;
+		ip6h = (const struct ipv6hdr *)(skb->data + off);
+		if (ip6h->version != 6)
+			return false;
+		payload_len = ntohs(ip6h->payload_len);
+		l4_off = off + sizeof(*ip6h);
+		if (l4_off + payload_len > skb->len)
+			return false;
+		nexthdr = ip6h->nexthdr;
+
+		if (nexthdr == IPPROTO_TCP) {
+			if (payload_len < sizeof(struct tcphdr))
+				return false;
+			csum = skb_checksum(skb, l4_off, payload_len, 0);
+			return csum_ipv6_magic(&ip6h->saddr, &ip6h->daddr,
+					       payload_len, IPPROTO_TCP,
+					       csum) == 0;
+		}
+		if (nexthdr == IPPROTO_UDP) {
+			const struct udphdr *uh;
+
+			if (payload_len < sizeof(struct udphdr) ||
+			    !pskb_may_pull(skb, l4_off + sizeof(struct udphdr)))
+				return false;
+			uh = (const struct udphdr *)(skb->data + l4_off);
+			if (!uh->check)
+				return false;
+			ip6h = (const struct ipv6hdr *)(skb->data + off);
+			csum = skb_checksum(skb, l4_off, payload_len, 0);
+			return csum_ipv6_magic(&ip6h->saddr, &ip6h->daddr,
+					       payload_len, IPPROTO_UDP,
+					       csum) == 0;
+		}
+		return false;
+	}
+
 	return false;
 }
 
-static int nsim_copy_skb_bits(const struct sk_buff *skb, int offset,
-			      void *to, int len)
+static bool nsim_rx_vlan_process(struct netdevsim *ns, struct sk_buff *skb)
 {
-	const struct skb_shared_info *shinfo = skb_shinfo(skb);
-	int start = skb_headlen(skb);
-	struct sk_buff *frag_iter;
-	int i, copy;
+	struct net_device *dev = ns->netdev;
+	struct vlan_ethhdr *veth;
+	__be16 vlan_proto;
+	u16 tci, vid;
 
-	if (skb_frags_readable(skb) && !nsim_skb_has_net_iov(skb))
-		return skb_copy_bits(skb, offset, to, len);
-
-	if (offset > (int)skb->len - len)
-		return -EFAULT;
-
-	copy = start - offset;
-	if (copy > 0) {
-		if (copy > len)
-			copy = len;
-		memcpy(to, skb->data + offset, copy);
-		len -= copy;
-		if (!len)
-			return 0;
-		offset += copy;
-		to += copy;
-	}
-
-	for (i = 0; i < shinfo->nr_frags; i++) {
-		const skb_frag_t *frag = &shinfo->frags[i];
-		int end = start + skb_frag_size(frag);
-
-		copy = end - offset;
-		if (copy > 0) {
-			unsigned int f_off = offset - start;
-
-			if (copy > len)
-				copy = len;
-			if (skb_frag_is_net_iov(frag)) {
-				int err;
-
-				err = net_devmem_niov_copy_to_buf(skb_frag_net_iov(frag),
-								  skb_frag_off(frag) + f_off,
-								  to, copy);
-				if (err)
-					return err;
-			} else {
-				memcpy_from_page(to, skb_frag_page(frag),
-						 skb_frag_off(frag) + f_off,
-						 copy);
-			}
-			len -= copy;
-			if (!len)
-				return 0;
-			offset += copy;
-			to += copy;
+	if (skb_vlan_tag_present(skb)) {
+		vlan_proto = skb->vlan_proto;
+		vid = skb_vlan_tag_get_id(skb);
+		if (!(dev->flags & IFF_PROMISC) && vid != 0) {
+			if (vlan_proto == htons(ETH_P_8021Q) &&
+			    (dev->features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
+			    !test_bit(vid, ns->vlan.ctag))
+				return false;
+			if (vlan_proto == htons(ETH_P_8021AD) &&
+			    (dev->features & NETIF_F_HW_VLAN_STAG_FILTER) &&
+			    !test_bit(vid, ns->vlan.stag))
+				return false;
 		}
-		start = end;
-	}
-
-	skb_walk_frags(skb, frag_iter) {
-		int end = start + frag_iter->len;
-
-		copy = end - offset;
-		if (copy > 0) {
-			int err;
-
-			if (copy > len)
-				copy = len;
-			err = nsim_copy_skb_bits(frag_iter, offset - start,
-						 to, copy);
-			if (err)
-				return err;
-			len -= copy;
-			if (!len)
-				return 0;
-			offset += copy;
-			to += copy;
+		if ((vlan_proto == htons(ETH_P_8021Q) &&
+		     !(dev->features & NETIF_F_HW_VLAN_CTAG_RX)) ||
+		    (vlan_proto == htons(ETH_P_8021AD) &&
+		     !(dev->features & NETIF_F_HW_VLAN_STAG_RX))) {
+			if (!__vlan_hwaccel_push_inside(skb))
+				return false;
 		}
-		start = end;
+		return true;
 	}
 
-	return len ? -EFAULT : 0;
+	if (skb->len < VLAN_ETH_HLEN || !pskb_may_pull(skb, VLAN_ETH_HLEN))
+		return true;
+
+	veth = (struct vlan_ethhdr *)skb->data;
+	vlan_proto = veth->h_vlan_proto;
+	if (vlan_proto != htons(ETH_P_8021Q) &&
+	    vlan_proto != htons(ETH_P_8021AD))
+		return true;
+
+	tci = ntohs(veth->h_vlan_TCI);
+	vid = tci & VLAN_VID_MASK;
+
+	if (!(dev->flags & IFF_PROMISC) && vid != 0) {
+		if (vlan_proto == htons(ETH_P_8021Q) &&
+		    (dev->features & NETIF_F_HW_VLAN_CTAG_FILTER) &&
+		    !test_bit(vid, ns->vlan.ctag))
+			return false;
+		if (vlan_proto == htons(ETH_P_8021AD) &&
+		    (dev->features & NETIF_F_HW_VLAN_STAG_FILTER) &&
+		    !test_bit(vid, ns->vlan.stag))
+			return false;
+	}
+
+	if ((vlan_proto == htons(ETH_P_8021Q) &&
+	     (dev->features & NETIF_F_HW_VLAN_CTAG_RX)) ||
+	    (vlan_proto == htons(ETH_P_8021AD) &&
+	     (dev->features & NETIF_F_HW_VLAN_STAG_RX))) {
+		memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
+		__skb_pull(skb, VLAN_HLEN);
+		__vlan_hwaccel_put_tag(skb, vlan_proto, tci);
+	}
+
+	return true;
 }
 
-static int nsim_copy_skb_to_niov(const struct sk_buff *src_skb,
-				 unsigned int src_off,
-				 struct net_iov *dst_niov,
-				 unsigned int dst_off,
-				 unsigned int len)
+static void nsim_xdp_get_buff(struct xdp_buff *xdp)
 {
-	u8 buf[512];
+	struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
+	int i;
 
-	while (len > 0) {
-		unsigned int chunk = min_t(unsigned int, len, sizeof(buf));
-		int err;
+	get_page(virt_to_page(xdp->data));
+	if (likely(!xdp_buff_has_frags(xdp)))
+		return;
 
-		err = nsim_copy_skb_bits(src_skb, src_off, buf, chunk);
+	for (i = 0; i < sinfo->nr_frags; i++)
+		netmem_inc_ref(skb_frag_netmem(&sinfo->frags[i]));
+}
+
+static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev);
+
+static struct sk_buff *nsim_run_xdp(struct netdevsim *ns, struct nsim_rq *rq,
+				    struct sk_buff *skb, bool *xmitted)
+{
+	struct bpf_prog *xdp_prog = READ_ONCE(ns->xdp.prog);
+	struct xsk_buff_pool *xsk_pool = READ_ONCE(rq->xsk_pool);
+	void *orig_data, *orig_data_end;
+	struct xdp_buff xdp;
+	u32 frame_sz, act, metalen;
+	int off;
+
+	skb_prepare_for_gro(skb);
+
+	if (likely(!xdp_prog))
+		return skb;
+
+	if (xsk_pool && !skb_is_nonlinear(skb) &&
+	    skb->len <= xsk_pool_get_rx_frame_size(xsk_pool)) {
+		struct xdp_buff *xsk_xdp = xsk_buff_alloc(xsk_pool);
+
+		if (xsk_xdp) {
+			skb_copy_bits(skb, 0, xsk_xdp->data, skb->len);
+			xsk_xdp->data_end = xsk_xdp->data + skb->len;
+
+			rcu_read_lock();
+			act = bpf_prog_run_xdp(xdp_prog, xsk_xdp);
+			switch (act) {
+			case XDP_PASS:
+				rcu_read_unlock();
+				xsk_buff_free(xsk_xdp);
+				return skb;
+			case XDP_REDIRECT:
+				if (!xdp_do_redirect(ns->netdev, xsk_xdp,
+						     xdp_prog)) {
+					rcu_read_unlock();
+					*xmitted = true;
+					consume_skb(skb);
+					return NULL;
+				}
+				rcu_read_unlock();
+				xsk_buff_free(xsk_xdp);
+				kfree_skb(skb);
+				return NULL;
+			case XDP_TX:
+				rcu_read_unlock();
+				xsk_buff_free(xsk_xdp);
+				nsim_start_xmit(skb, ns->netdev);
+				return NULL;
+			default:
+				bpf_warn_invalid_xdp_action(ns->netdev,
+							    xdp_prog, act);
+				fallthrough;
+			case XDP_ABORTED:
+			case XDP_DROP:
+				rcu_read_unlock();
+				xsk_buff_free(xsk_xdp);
+				kfree_skb(skb);
+				return NULL;
+			}
+		}
+	}
+
+	if (!rq->page_pool || page_pool_is_unreadable(rq->page_pool))
+		return skb;
+
+	skb_prepare_for_gro(skb);
+	if (skb_shared(skb) || skb_head_is_locked(skb) ||
+	    skb_is_nonlinear(skb) ||
+	    skb_headroom(skb) < XDP_PACKET_HEADROOM) {
+		if (skb_pp_cow_data(rq->page_pool, &skb, XDP_PACKET_HEADROOM))
+			return NULL;
+	}
+
+	frame_sz = skb_end_pointer(skb) - skb->head +
+		   SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	xdp_init_buff(&xdp, frame_sz, &rq->xdp_rxq);
+	xdp_prepare_buff(&xdp, skb->head, skb_headroom(skb),
+			 skb_headlen(skb), true);
+	if (skb_shinfo(skb)->nr_frags) {
+		skb_shinfo(skb)->xdp_frags_size = skb->data_len;
+		xdp_buff_set_frags_flag(&xdp);
+	} else {
+		xdp_buff_clear_frags_flag(&xdp);
+	}
+
+	orig_data = xdp.data;
+	orig_data_end = xdp.data_end;
+
+	rcu_read_lock();
+	act = bpf_prog_run_xdp(xdp_prog, &xdp);
+	switch (act) {
+	case XDP_PASS:
+		break;
+	case XDP_TX: {
+		struct xdp_frame *xdpf;
+
+		WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
+		WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skb->len);
+		dev_sw_netstats_rx_add(ns->netdev, skb->len);
+		nsim_xdp_get_buff(&xdp);
+		consume_skb(skb);
+		xdpf = xdp_convert_buff_to_frame(&xdp);
+		if (unlikely(!xdpf)) {
+			xdp_return_buff(&xdp);
+			rcu_read_unlock();
+			return NULL;
+		}
+		skb = xdp_build_skb_from_frame(xdpf, ns->netdev);
+		rcu_read_unlock();
+		if (skb) {
+			__skb_push(skb, ETH_HLEN);
+			nsim_start_xmit(skb, ns->netdev);
+		}
+		return NULL;
+	}
+	case XDP_REDIRECT:
+		WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
+		WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skb->len);
+		dev_sw_netstats_rx_add(ns->netdev, skb->len);
+		nsim_xdp_get_buff(&xdp);
+		consume_skb(skb);
+		if (xdp_do_redirect(ns->netdev, &xdp, xdp_prog))
+			xdp_return_buff(&xdp);
+		else
+			*xmitted = true;
+		rcu_read_unlock();
+		return NULL;
+	default:
+		bpf_warn_invalid_xdp_action(ns->netdev, xdp_prog, act);
+		fallthrough;
+	case XDP_ABORTED:
+		trace_xdp_exception(ns->netdev, xdp_prog, act);
+		fallthrough;
+	case XDP_DROP:
+		WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
+		WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skb->len);
+		dev_sw_netstats_rx_add(ns->netdev, skb->len);
+		rcu_read_unlock();
+		kfree_skb(skb);
+		return NULL;
+	}
+	rcu_read_unlock();
+
+	off = orig_data - xdp.data;
+	if (off > 0)
+		__skb_push(skb, off);
+	else if (off < 0)
+		__skb_pull(skb, -off);
+
+	skb_reset_mac_header(skb);
+	skb->len -= skb->data_len;
+	if (xdp_buff_has_frags(&xdp)) {
+		skb->data_len = skb_shinfo(skb)->xdp_frags_size;
+		skb->len += skb->data_len;
+	} else {
+		skb->data_len = 0;
+	}
+
+	off = xdp.data_end - orig_data_end;
+	if (off != 0) {
+		skb_set_tail_pointer(skb, xdp.data_end - xdp.data);
+		skb->len += off;
+	}
+
+	metalen = xdp.data - xdp.data_meta;
+	if (metalen)
+		skb_metadata_set(skb, metalen);
+
+	return skb;
+}
+
+static void nsim_drain_hw_gro_rx_list(struct netdevsim *ns, struct nsim_rq *rq)
+{
+	struct net_device *dev = ns->netdev;
+	struct sk_buff *skb, *tmp;
+	LIST_HEAD(list);
+
+	list_splice_init(&rq->hw_gro.rx_list, &list);
+	rq->hw_gro.rx_count = 0;
+
+	list_for_each_entry_safe(skb, tmp, &list, list) {
+		unsigned int pkts = max_t(u16, 1, skb_shinfo(skb)->gso_segs);
+		unsigned int len = skb->len;
+
+		skb_list_del_init(skb);
+		WRITE_ONCE(rq->rx_packets, rq->rx_packets + pkts);
+		WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + len);
+		dev_sw_netstats_rx_add(dev, len);
+
+		if (dev->features & NETIF_F_GRO)
+			napi_gro_receive(&rq->napi, skb);
+		else
+			netif_receive_skb(skb);
+	}
+}
+
+static int nsim_rcv(struct nsim_rq *rq, int budget)
+{
+	struct net_device *dev = rq->napi.dev;
+	struct netdevsim *ns = netdev_priv(dev);
+	bool xdp_xmitted = false;
+	struct sk_buff *skb;
+	int i;
+
+	if (xchg(&rq->gro_flush_pending, false)) {
+		gro_flush(&rq->hw_gro, false);
+		nsim_drain_hw_gro_rx_list(ns, rq);
+	}
+
+	for (i = 0; i < budget; i++) {
+		bool use_pp_rx, valid_csum;
+		unsigned int len;
+
+		skb = skb_dequeue(&rq->skb_queue);
+		if (!skb)
+			break;
+
+		/* Probe page_pool allocation for fault injection tests (pp_alloc_fail.py) */
+		if (rq->page_pool &&
+		    !page_pool_is_unreadable(rq->page_pool)) {
+			struct page *probe_page;
+
+			probe_page = page_pool_dev_alloc_pages(rq->page_pool);
+			if (!probe_page)
+				WRITE_ONCE(rq->alloc_fail, rq->alloc_fail + 1);
+			else
+				page_pool_put_full_page(rq->page_pool,
+							probe_page, true);
+		}
+
+		if (!nsim_rx_vlan_process(ns, skb)) {
+			kfree_skb(skb);
+			continue;
+		}
+
+		rq->cur_rx_tstamp = ktime_get_real_ns();
+		rq->cur_rx_hash = skb_get_hash_raw(skb);
+		rq->cur_rx_hash_type = nsim_skb_xdp_rss_type(skb);
+
+		if (ns->hwtstamp_cfg.rx_filter == HWTSTAMP_FILTER_ALL)
+			skb_hwtstamps(skb)->hwtstamp =
+				ns_to_ktime(rq->cur_rx_tstamp);
+
+		skb = nsim_run_xdp(ns, rq, skb, &xdp_xmitted);
+		if (!skb)
+			continue;
+
+		use_pp_rx = rq->page_pool &&
+			    page_pool_is_unreadable(rq->page_pool);
+		if (use_pp_rx && skb_frags_readable(skb)) {
+			struct sk_buff *pp_skb;
+
+			pp_skb = nsim_page_pool_copy_rx(ns, rq, skb);
+			consume_skb(skb);
+			if (!pp_skb)
+				continue;
+			skb = pp_skb;
+		}
+
+		len = skb->len;
+		nsim_mac_record_frame(ns, skb, len, -1, false);
+		nsim_dev_hwstats_record(dev, len, false);
+
+		skb->dev = dev;
+		skb->protocol = eth_type_trans(skb, dev);
+
+		if (skb->ip_summed == CHECKSUM_PARTIAL) {
+			if (!skb_is_gso(skb))
+				skb->ip_summed = (dev->features & NETIF_F_RXCSUM) ?
+						 CHECKSUM_UNNECESSARY : CHECKSUM_NONE;
+		} else if (skb_frags_readable(skb)) {
+			valid_csum = (dev->features & NETIF_F_RXCSUM) &&
+				     nsim_rx_csum_valid(skb);
+			skb->ip_summed = valid_csum ? CHECKSUM_UNNECESSARY :
+						      CHECKSUM_NONE;
+		} else if (dev->features & NETIF_F_RXCSUM) {
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		}
+
+		if ((dev->features & NETIF_F_GRO_HW) &&
+		    !skb_has_extensions(skb) &&
+		    skb_frags_readable(skb)) {
+			gro_receive_skb(&rq->hw_gro, skb);
+			nsim_drain_hw_gro_rx_list(ns, rq);
+			if (rq->hw_gro.bitmask)
+				hrtimer_start(&rq->gro_timer,
+					      ns_to_ktime(NSIM_HW_GRO_TIMEOUT_NS),
+					      HRTIMER_MODE_REL_PINNED);
+			else
+				hrtimer_try_to_cancel(&rq->gro_timer);
+		} else {
+			if (rq->hw_gro.bitmask) {
+				gro_flush(&rq->hw_gro, false);
+				nsim_drain_hw_gro_rx_list(ns, rq);
+			}
+			WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
+			WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + len);
+			dev_sw_netstats_rx_add(dev, len);
+			if (skb_is_gso(skb) || skb_shared(skb) ||
+			    skb_unclone(skb, GFP_ATOMIC)) {
+				if (rq->napi.gro.bitmask ||
+				    rq->napi.gro.rx_count)
+					gro_flush_normal(&rq->napi.gro, false);
+				netif_receive_skb(skb);
+			} else {
+				napi_gro_receive(&rq->napi, skb);
+			}
+		}
+	}
+
+	if (xdp_xmitted)
+		xdp_do_flush();
+
+	return i;
+}
+
+static void nsim_xsk_tx(struct netdevsim *ns, struct nsim_rq *rq)
+{
+	struct xsk_buff_pool *pool = READ_ONCE(rq->xsk_pool);
+	struct xdp_desc desc;
+	u32 sent = 0;
+
+	if (likely(!pool))
+		return;
+
+	while (sent < 64 && xsk_tx_peek_desc(pool, &desc)) {
+		void *data = xsk_buff_raw_get_data(pool, desc.addr);
+		struct sk_buff *skb;
+
+		skb = __netdev_alloc_skb(ns->netdev, desc.len, GFP_ATOMIC);
+		if (skb) {
+			skb_put_data(skb, data, desc.len);
+			skb_reset_mac_header(skb);
+			nsim_start_xmit(skb, ns->netdev);
+		}
+		sent++;
+	}
+	if (sent) {
+		xsk_tx_release(pool);
+		xsk_tx_completed(pool, sent);
+	}
+}
+
+static int nsim_poll(struct napi_struct *napi, int budget)
+{
+	struct nsim_rq *rq = container_of(napi, struct nsim_rq, napi);
+	struct netdevsim *ns = netdev_priv(napi->dev);
+	int done;
+
+	if (unlikely(!budget)) {
+		if (ns->txq)
+			WRITE_ONCE(ns->txq[0].netpoll_polled, true);
+		if (netif_queue_stopped(napi->dev))
+			netif_tx_wake_all_queues(napi->dev);
+		return 0;
+	}
+
+	nsim_xsk_tx(ns, rq);
+	done = nsim_rcv(rq, budget);
+	if (done < budget) {
+		if (napi_complete_done(napi, done) &&
+		    !skb_queue_empty(&rq->skb_queue))
+			nsim_schedule_rq_napi(ns, rq->xdp_rxq.queue_index, rq);
+	}
+
+	return done;
+}
+
+static enum hrtimer_restart nsim_napi_timer_fn(struct hrtimer *timer)
+{
+	struct nsim_rq *rq = container_of(timer, struct nsim_rq, napi_timer);
+	struct netdevsim *ns = netdev_priv(rq->napi.dev);
+	int rxq_idx = rq->xdp_rxq.queue_index;
+
+	nsim_schedule_rq_napi(ns, rxq_idx, rq);
+	return HRTIMER_NORESTART;
+}
+
+static enum hrtimer_restart nsim_gro_timer_fn(struct hrtimer *timer)
+{
+	struct nsim_rq *rq = container_of(timer, struct nsim_rq, gro_timer);
+	struct netdevsim *ns = netdev_priv(rq->napi.dev);
+
+	WRITE_ONCE(rq->gro_flush_pending, true);
+	nsim_schedule_rq_napi(ns, rq->xdp_rxq.queue_index, rq);
+	return HRTIMER_NORESTART;
+}
+
+static int nsim_create_page_pool(struct net_device *dev, struct page_pool **p,
+				 struct napi_struct *napi, int idx,
+				 unsigned int order)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	struct page_pool_params params = {
+		.order = order,
+		.pool_size = NSIM_RING_SIZE,
+		.max_len = PAGE_SIZE << order,
+		.nid = NUMA_NO_NODE,
+		.dev = &ns->nsim_bus_dev->dev,
+		.napi = napi,
+		.dma_dir = DMA_FROM_DEVICE,
+		.netdev = dev,
+		.queue_idx = idx,
+	};
+	struct page_pool *pool;
+
+	if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_DISABLED)
+		params.flags |= PP_FLAG_ALLOW_UNREADABLE_NETMEM;
+	if (ns->nsim_bus_dev->dev.dma_mask && PP_DMA_INDEX_BITS)
+		params.flags |= PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
+
+	pool = page_pool_create(&params);
+	if (IS_ERR(pool))
+		return PTR_ERR(pool);
+
+	*p = pool;
+	return 0;
+}
+
+static struct nsim_rq *nsim_queue_alloc(struct net_device *dev)
+{
+	struct nsim_rq *rq;
+
+	rq = kzalloc_obj(*rq, GFP_KERNEL_ACCOUNT);
+	if (!rq)
+		return NULL;
+
+	skb_queue_head_init(&rq->skb_queue);
+	hrtimer_setup(&rq->napi_timer, nsim_napi_timer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_PINNED);
+	hrtimer_setup(&rq->gro_timer, nsim_gro_timer_fn, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_PINNED);
+	spin_lock_init(&rq->gro_lock);
+	gro_init(&rq->hw_gro);
+	rq->hw_gro.hw_mode = true;
+	rq->hw_gro.max_flows = 64;
+	INIT_CSD(&rq->csd, nsim_napi_csd_fn, rq);
+	rq->irq = -EINVAL;
+	return rq;
+}
+
+static void nsim_free_irq(struct nsim_rq *rq)
+{
+	if (rq->irq < 0)
+		return;
+
+	netif_napi_set_irq_locked(&rq->napi, -1);
+	free_irq(rq->irq, rq);
+	irq_free_desc(rq->irq);
+	rq->irq = -EINVAL;
+}
+
+static void nsim_queue_free(struct net_device *dev, struct nsim_rq *rq)
+{
+	hrtimer_cancel(&rq->napi_timer);
+	hrtimer_cancel(&rq->gro_timer);
+	gro_cleanup(&rq->hw_gro);
+	nsim_free_irq(rq);
+	skb_queue_purge_reason(&rq->skb_queue, SKB_DROP_REASON_QUEUE_PURGE);
+	kfree(rq);
+}
+
+static void nsim_init_irq(struct nsim_rq *rq, int idx)
+{
+	unsigned int max_cpus;
+
+	if (rq->irq >= 0) {
+		netif_napi_set_irq_locked(&rq->napi, rq->irq);
+		return;
+	}
+
+	rq->irq = irq_alloc_desc(NUMA_NO_NODE);
+	if (rq->irq < 0)
+		return;
+
+	irq_set_chip_and_handler(rq->irq, &nsim_irq_chip, handle_simple_irq);
+	irq_clear_status_flags(rq->irq, IRQ_NOREQUEST | IRQ_NOAUTOEN);
+	if (request_irq(rq->irq, nsim_irq_handler, 0, "netdevsim", rq)) {
+		irq_free_desc(rq->irq);
+		rq->irq = -EINVAL;
+		return;
+	}
+	max_cpus = num_online_cpus() > 2 ? num_online_cpus() - 2 : 1U;
+	irq_set_affinity(rq->irq, cpumask_of(idx % max_cpus));
+	netif_napi_set_irq_locked(&rq->napi, rq->irq);
+}
+
+static int nsim_init_napi(struct netdevsim *ns)
+{
+	struct net_device *dev = ns->netdev;
+	struct nsim_rq *rq;
+	int err, i;
+
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		rq = ns->rq[i];
+
+		netif_napi_add_config_locked(dev, &rq->napi, nsim_poll, i);
+		nsim_init_irq(rq, i);
+	}
+
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		rq = ns->rq[i];
+
+		err = nsim_create_page_pool(dev, &rq->page_pool, &rq->napi,
+					    i, 0);
 		if (err)
-			return err;
-		err = net_devmem_niov_copy_from_buf(dst_niov, dst_off,
-						    buf, chunk);
-		if (err)
-			return err;
+			goto err_pp_destroy;
 
-		src_off += chunk;
-		dst_off += chunk;
-		len -= chunk;
+		err = xdp_rxq_info_reg(&rq->xdp_rxq, dev, i, rq->napi.napi_id);
+		if (err) {
+			page_pool_destroy(rq->page_pool);
+			rq->page_pool = NULL;
+			goto err_pp_destroy;
+		}
+		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+						 MEM_TYPE_PAGE_POOL,
+						 rq->page_pool);
+		if (err) {
+			xdp_rxq_info_unreg(&rq->xdp_rxq);
+			page_pool_destroy(rq->page_pool);
+			rq->page_pool = NULL;
+			goto err_pp_destroy;
+		}
+	}
+
+	return 0;
+
+err_pp_destroy:
+	while (i--) {
+		xdp_rxq_info_unreg(&ns->rq[i]->xdp_rxq);
+		page_pool_destroy(ns->rq[i]->page_pool);
+		ns->rq[i]->page_pool = NULL;
+	}
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		nsim_free_irq(ns->rq[i]);
+		__netif_napi_del_locked(&ns->rq[i]->napi);
+	}
+	return err;
+}
+
+static void nsim_enable_napi(struct netdevsim *ns)
+{
+	struct net_device *dev = ns->netdev;
+	int i;
+
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		struct nsim_rq *rq = ns->rq[i];
+
+		netif_queue_set_napi(dev, i, NETDEV_QUEUE_TYPE_RX, &rq->napi);
+		napi_enable_locked(&rq->napi);
+	}
+}
+
+static int nsim_open(struct net_device *dev)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	struct netdevsim *peer;
+	int err;
+
+	netdev_assert_locked(dev);
+
+	err = nsim_init_napi(ns);
+	if (err)
+		return err;
+
+	nsim_enable_napi(ns);
+
+	peer = rtnl_dereference(ns->peer);
+	if (peer && netif_running(peer->netdev)) {
+		nsim_update_carrier(ns);
+		nsim_update_carrier(peer);
+	} else {
+		nsim_update_carrier(ns);
 	}
 
 	return 0;
 }
 
-static struct sk_buff *nsim_copy_devmem_skb(const struct sk_buff *skb)
+static void nsim_del_napi(struct netdevsim *ns)
 {
-	unsigned int size = skb_end_offset(skb) + skb->data_len;
-	int headerlen = skb_headroom(skb);
-	struct sk_buff *n;
+	struct net_device *dev = ns->netdev;
+	int i;
 
-	n = alloc_skb(size, GFP_ATOMIC);
-	if (!n)
-		return NULL;
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		struct nsim_rq *rq = ns->rq[i];
 
-	skb_reserve(n, headerlen);
-	skb_put(n, skb->len);
-	memcpy(n->head, skb->head, headerlen);
-	if (nsim_copy_skb_bits(skb, 0, n->data, skb->len)) {
-		kfree_skb(n);
-		return NULL;
+		napi_disable_locked(&rq->napi);
+		hrtimer_cancel(&rq->napi_timer);
+		hrtimer_cancel(&rq->gro_timer);
+		gro_cleanup(&rq->hw_gro);
+		netif_napi_set_irq_locked(&rq->napi, -1);
+		__netif_napi_del_locked(&rq->napi);
 	}
-
-	skb_copy_header(n, skb);
-	n->unreadable = 0;
-	return n;
+	synchronize_rcu();
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		if (xdp_rxq_info_is_reg(&ns->rq[i]->xdp_rxq))
+			xdp_rxq_info_unreg(&ns->rq[i]->xdp_rxq);
+		page_pool_destroy(ns->rq[i]->page_pool);
+		ns->rq[i]->page_pool = NULL;
+	}
 }
 
-static struct sk_buff *nsim_build_pp_rx_skb(struct net_device *rx_dev,
-					    struct nsim_rq *rq,
-					    const struct sk_buff *skb)
+static int nsim_stop(struct net_device *dev)
 {
-	unsigned int max_frag = PAGE_SIZE << rq->page_pool->p.order;
-	unsigned int probe_len = min_t(unsigned int, skb->len, 256);
-	bool unreadable = page_pool_is_unreadable(rq->page_pool);
-	unsigned int len = skb->len;
-	unsigned int hdr_len, payload_len;
-	struct sk_buff *rx_skb;
-	u8 hdr_buf[256];
+	struct netdevsim *ns = netdev_priv(dev);
+	struct netdevsim *peer;
 
-	if (nsim_copy_skb_bits(skb, 0, hdr_buf, probe_len))
-		return NULL;
+	netdev_assert_locked(dev);
 
-	hdr_len = eth_get_headlen(rx_dev, hdr_buf, probe_len);
-	if (hdr_len > len)
-		hdr_len = len;
-	payload_len = len - hdr_len;
+	netif_carrier_off(dev);
+	peer = rtnl_dereference(ns->peer);
+	if (peer)
+		nsim_update_carrier(peer);
 
-	if (!payload_len || payload_len <= rx_dev->cfg->hds_thresh) {
-		rx_skb = napi_alloc_skb(&rq->napi, len);
-		if (!rx_skb)
-			return NULL;
-		if (nsim_copy_skb_bits(skb, 0, skb_put(rx_skb, len), len)) {
-			dev_kfree_skb_any(rx_skb);
-			return NULL;
-		}
-		return rx_skb;
-	}
+	nsim_del_napi(ns);
 
-	rx_skb = napi_alloc_skb(&rq->napi, hdr_len);
-	if (!rx_skb)
-		return NULL;
-
-	if (nsim_copy_skb_bits(skb, 0, skb_put(rx_skb, hdr_len), hdr_len))
-		goto err_free_skb;
-
-	skb_mark_for_recycle(rx_skb);
-	rx_skb->unreadable = unreadable;
-
-	for (unsigned int src_off = hdr_len, rem = payload_len, frag_idx = 0;
-	     rem > 0; frag_idx++) {
-		unsigned int alloc_len = max_frag;
-		unsigned int frag_off = 0;
-		unsigned int copy_len;
-		netmem_ref netmem;
-		int err;
-
-		if (frag_idx >= MAX_SKB_FRAGS)
-			goto err_free_skb;
-
-		netmem = page_pool_dev_alloc_netmem(rq->page_pool, &frag_off,
-						    &alloc_len);
-		if (!netmem)
-			goto err_free_skb;
-
-		copy_len = min(rem, alloc_len);
-		if (netmem_is_net_iov(netmem))
-			err = nsim_copy_skb_to_niov(skb, src_off,
-						    netmem_to_net_iov(netmem),
-						    frag_off, copy_len);
-		else
-			err = nsim_copy_skb_bits(skb, src_off,
-						 netmem_address(netmem) + frag_off,
-						 copy_len);
-		if (err) {
-			page_pool_put_full_netmem(rq->page_pool, netmem, true);
-			goto err_free_skb;
-		}
-
-		skb_add_rx_frag_netmem(rx_skb, frag_idx, netmem, frag_off,
-				       copy_len, alloc_len);
-		src_off += copy_len;
-		rem -= copy_len;
-	}
-
-	return rx_skb;
-
-err_free_skb:
-	dev_kfree_skb_any(rx_skb);
-	return NULL;
+	return 0;
 }
 
-static int nsim_forward_skb(struct net_device *tx_dev,
-			    struct net_device *rx_dev,
-			    struct sk_buff *skb,
-			    struct nsim_rq *rq,
-			    int rxq,
-			    bool set_csum_unnecessary,
+static int nsim_forward_skb(struct net_device *peer_dev, struct sk_buff *skb,
+			    struct nsim_rq *rq, int rxq_idx,
+			    u32 rss_hash, enum pkt_hash_types rss_type,
 			    struct skb_ext *psp_ext)
 {
+	struct netdevsim *peer_ns = netdev_priv(peer_dev);
+	u32 coal_usecs;
+	u64 delay_ns;
 	int ret;
 
-	ret = __dev_forward_skb(rx_dev, skb);
+	if (skb_queue_len(&rq->skb_queue) >= 65536) {
+		if (psp_ext)
+			__skb_ext_put(psp_ext);
+		dev_kfree_skb_any(skb);
+		return NET_RX_DROP;
+	}
+
+	ret = __dev_forward_skb(peer_dev, skb);
 	if (ret) {
 		if (psp_ext)
 			__skb_ext_put(psp_ext);
 		return ret;
 	}
-
-	if (set_csum_unnecessary)
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
-	skb_record_rx_queue(skb, rxq);
+	skb_push(skb, ETH_HLEN);
 
 	nsim_psp_handle_ext(skb, psp_ext);
 
-	return nsim_napi_rx(tx_dev, rx_dev, rq, skb);
+	if (rss_type != PKT_HASH_TYPE_NONE)
+		skb_set_hash(skb, rss_hash, rss_type);
+	skb_record_rx_queue(skb, rxq_idx);
+	skb_queue_tail(&rq->skb_queue, skb);
+
+	coal_usecs = READ_ONCE(peer_ns->ethtool.coalesce.rx_coalesce_usecs);
+	delay_ns = (u64)coal_usecs * NSEC_PER_USEC;
+	if (READ_ONCE(peer_dev->gro_flush_timeout)) {
+		delay_ns = max3((u64)delay_ns,
+				(u64)READ_ONCE(peer_dev->gro_flush_timeout),
+				(u64)(2 * NSEC_PER_MSEC));
+		hrtimer_start(&rq->napi_timer, ns_to_ktime(delay_ns),
+			      HRTIMER_MODE_REL_PINNED);
+	} else if (delay_ns > 0) {
+		if (!hrtimer_active(&rq->napi_timer))
+			hrtimer_start(&rq->napi_timer, ns_to_ktime(delay_ns),
+				      HRTIMER_MODE_REL_PINNED);
+	} else {
+		nsim_schedule_rq_napi(peer_ns, rxq_idx, rq);
+	}
+
+	return NET_RX_SUCCESS;
 }
 
 static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	unsigned int pkts = max_t(unsigned int, 1, skb_shinfo(skb)->gso_segs);
 	struct netdevsim *ns = netdev_priv(dev);
-	bool tx_devmem = nsim_skb_has_net_iov(skb);
 	struct skb_ext *psp_ext = NULL;
 	struct net_device *peer_dev;
 	unsigned int len = skb->len;
 	struct netdevsim *peer_ns;
-	struct netdev_config *cfg;
-	bool rx_devmem, use_pp_rx;
 	struct nsim_rq *rq;
-	unsigned int i;
+	u32 rss_hash = 0;
+	enum pkt_hash_types rss_type = PKT_HASH_TYPE_NONE;
+	u16 txq_idx;
+	bool use_pp_rx;
+	bool was_gso;
+	unsigned int gso_segs;
 	int rxq;
-	int dr;
+	int dr = SKB_DROP_REASON_NOT_SPECIFIED;
+
+	if (unlikely(netpoll_tx_running(dev) &&
+		     READ_ONCE(ns->ethtool.ring.tx_pending) == 1 &&
+		     ns->txq && !xchg(&ns->txq[0].netpoll_polled, false)))
+		return NETDEV_TX_BUSY;
 
 	rcu_read_lock();
-	if (tx_devmem) {
-		struct sk_buff *copy_skb = nsim_copy_devmem_skb(skb);
-
-		if (!copy_skb)
-			goto out_drop_any;
-		skb_tx_timestamp(skb);
-		consume_skb(skb);
-		skb = copy_skb;
-	}
-	if (!nsim_ipsec_tx(ns, skb))
-		goto out_drop_any;
-
-	/* Check if loopback mode is enabled */
 	if (dev->features & NETIF_F_LOOPBACK) {
 		peer_ns = ns;
 		peer_dev = dev;
 	} else {
 		peer_ns = rcu_dereference(ns->peer);
 		if (!peer_ns)
-			goto out_drop_any;
+			goto out_drop_free;
 		peer_dev = peer_ns->netdev;
+	}
+	if (!netif_running(peer_dev))
+		goto out_drop_free;
+
+	if (skb_vlan_tag_present(skb) && READ_ONCE(peer_ns->xdp.prog)) {
+		skb = __vlan_hwaccel_push_inside(skb);
+		if (unlikely(!skb))
+			goto out_drop_cnt;
+		len = skb->len;
+	}
+
+	if (nsim_skb_has_net_iov(skb)) {
+		struct sk_buff *copied = nsim_devmem_tx_copy(skb, dev);
+
+		consume_skb(skb);
+		if (!copied)
+			goto out_drop_cnt;
+		skb = copied;
+	}
+
+	txq_idx = skb_get_queue_mapping(skb);
+	if (txq_idx >= dev->num_tx_queues)
+		txq_idx = 0;
+
+	was_gso = skb_is_gso(skb);
+	gso_segs = was_gso ? max_t(unsigned int, 1, skb_shinfo(skb)->gso_segs) : 1;
+
+	skb = nsim_ipsec_tx(ns, skb, peer_ns != ns);
+	if (!skb)
+		goto out_drop_cnt;
+
+	if (skb->next) {
+		struct sk_buff *curr, *next;
+		unsigned int pkts = 0, bytes = 0;
+
+		skb_list_walk_safe(skb, curr, next) {
+			unsigned int slen = curr->len;
+
+			skb_mark_not_on_list(curr);
+			rxq = nsim_select_rxq(peer_ns, curr, &rss_hash, &rss_type);
+			if (rxq < 0) {
+				dev_kfree_skb_any(curr);
+				continue;
+			}
+			rq = peer_ns->rq[rxq];
+			nsim_tx_csum_complete(curr);
+			nsim_mac_record_frame(ns, curr, slen, txq_idx, true);
+			nsim_dev_hwstats_record(dev, slen, true);
+			if (unlikely(nsim_forward_skb(peer_dev, curr, rq, rxq,
+						      rss_hash, rss_type, NULL) ==
+				     NET_RX_DROP)) {
+				u64_stats_update_begin(&ns->syncp);
+				u64_stats_inc(&ns->tx_dropped);
+				u64_stats_update_end(&ns->syncp);
+			} else {
+				pkts++;
+				bytes += slen;
+			}
+		}
+		if (pkts) {
+			dev_sw_netstats_tx_add(dev, pkts, bytes);
+			if (ns->txq) {
+				WRITE_ONCE(ns->txq[txq_idx].packets,
+					   ns->txq[txq_idx].packets + pkts);
+				WRITE_ONCE(ns->txq[txq_idx].bytes,
+					   ns->txq[txq_idx].bytes + bytes);
+				WRITE_ONCE(ns->txq[txq_idx].hw_gso_packets,
+					   ns->txq[txq_idx].hw_gso_packets + 1);
+				WRITE_ONCE(ns->txq[txq_idx].hw_gso_wire_packets,
+					   ns->txq[txq_idx].hw_gso_wire_packets +
+					   pkts);
+			}
+		}
+		rcu_read_unlock();
+		return NETDEV_TX_OK;
 	}
 
 	dr = nsim_do_psp(skb, ns, peer_ns, &psp_ext);
 	if (dr)
 		goto out_drop_free;
+	len = skb->len;
 
-	rxq = nsim_select_rxq(peer_ns, skb);
-	if (rxq < 0)
-		goto out_drop_any;
+	rxq = nsim_select_rxq(peer_ns, skb, &rss_hash, &rss_type);
+	if (rxq < 0) {
+		if (psp_ext)
+			__skb_ext_put(psp_ext);
+		goto out_drop_free;
+	}
 	rq = peer_ns->rq[rxq];
-	if (!rq || !rq->page_pool)
-		goto out_drop_any;
-	rx_devmem = page_pool_is_unreadable(rq->page_pool);
-	use_pp_rx = rx_devmem ||
-		    peer_dev->cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_ENABLED;
 
-	if (!tx_devmem)
-		skb_tx_timestamp(skb);
+	use_pp_rx = rq->page_pool &&
+		    page_pool_is_unreadable(rq->page_pool);
 
-	if (use_pp_rx) {
-		struct sk_buff *segs, *next;
-
-		if (skb_is_gso(skb)) {
-			segs = skb_gso_segment(skb, 0);
-			if (IS_ERR(segs)) {
-				if (psp_ext)
-					__skb_ext_put(psp_ext);
-				goto out_drop_any;
-			}
-			consume_skb(skb);
-		} else {
-			if (skb->ip_summed == CHECKSUM_PARTIAL &&
-			    skb_checksum_help(skb)) {
-				if (psp_ext)
-					__skb_ext_put(psp_ext);
-				goto out_drop_any;
-			}
-			segs = skb;
-			skb->next = NULL;
+	if (skb_is_nonlinear(skb) && !was_gso &&
+	    (use_pp_rx || (peer_dev->features & NETIF_F_GRO_HW) ||
+	     READ_ONCE(peer_ns->xdp.prog))) {
+		if (skb_linearize(skb)) {
+			if (psp_ext)
+				__skb_ext_put(psp_ext);
+			goto out_drop_free;
 		}
-
-		skb_list_walk_safe(segs, skb, next) {
-			struct sk_buff *rx_skb;
-
-			skb_mark_not_on_list(skb);
-			rx_skb = nsim_build_pp_rx_skb(peer_dev, rq, skb);
-			consume_skb(skb);
-			if (!rx_skb) {
-				if (psp_ext)
-					__skb_ext_put(psp_ext);
-				kfree_skb_list(next);
-				goto out_drop_cnt;
-			}
-
-			if (unlikely(nsim_forward_skb(dev, peer_dev, rx_skb,
-						      rq, rxq, true,
-						      psp_ext) == NET_RX_DROP)) {
-				kfree_skb_list(next);
-				goto out_drop_cnt;
-			}
-			psp_ext = NULL;
-		}
-	} else {
-		cfg = peer_dev->cfg;
-		if (skb_is_nonlinear(skb) &&
-		    (cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_ENABLED ||
-		     (cfg->hds_config == ETHTOOL_TCP_DATA_SPLIT_ENABLED &&
-		      cfg->hds_thresh > len)))
-			skb_linearize(skb);
-
-		if (unlikely(nsim_forward_skb(dev, peer_dev, skb, rq, rxq,
-					      false, psp_ext) == NET_RX_DROP))
-			goto out_drop_cnt;
 	}
 
-	if (!peer_ns->ethtool.coalesce.rx_coalesce_usecs)
-		napi_schedule(&rq->napi);
-	else if (!hrtimer_active(&rq->napi_timer))
-		hrtimer_start(&rq->napi_timer,
-			      us_to_ktime(peer_ns->ethtool.coalesce.rx_coalesce_usecs),
-			      HRTIMER_MODE_REL);
+	if ((skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) &&
+	    ns->hwtstamp_cfg.tx_type == HWTSTAMP_TX_ON) {
+		struct skb_shared_hwtstamps hwtstamps = {
+			.hwtstamp = ktime_get_real(),
+		};
+
+		skb_tstamp_tx(skb, &hwtstamps);
+	}
+
+	if (was_gso && !psp_ext &&
+	    (use_pp_rx || (peer_dev->features & NETIF_F_GRO_HW) ||
+	     (skb_shinfo(skb)->gso_type &
+	      (SKB_GSO_PARTIAL | SKB_GSO_UDP_L4 | SKB_GSO_UDP_TUNNEL |
+	       SKB_GSO_UDP_TUNNEL_CSUM | SKB_GSO_GRE | SKB_GSO_GRE_CSUM |
+	       SKB_GSO_IPXIP4 | SKB_GSO_IPXIP6)))) {
+		struct sk_buff *segs, *curr, *next;
+		unsigned int pkts = 0, bytes = 0;
+
+		if (skb_shinfo(skb)->gso_type & SKB_GSO_PARTIAL) {
+			if (skb_shinfo(skb)->gso_type &
+			    SKB_GSO_UDP_TUNNEL_CSUM) {
+				skb_shinfo(skb)->gso_type &=
+					~SKB_GSO_UDP_TUNNEL_CSUM;
+				skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_TUNNEL;
+			}
+			if (skb_shinfo(skb)->gso_type & SKB_GSO_GRE_CSUM) {
+				skb_shinfo(skb)->gso_type &= ~SKB_GSO_GRE_CSUM;
+				skb_shinfo(skb)->gso_type |= SKB_GSO_GRE;
+			}
+		}
+		segs = skb_gso_segment(skb, 0);
+		if (IS_ERR_OR_NULL(segs)) {
+			if (psp_ext)
+				__skb_ext_put(psp_ext);
+			goto out_drop_free;
+		}
+		consume_skb(skb);
+
+		skb_list_walk_safe(segs, curr, next) {
+			unsigned int slen = curr->len;
+
+			skb_mark_not_on_list(curr);
+			if (psp_ext)
+				refcount_inc(&psp_ext->refcnt);
+			nsim_tx_csum_complete(curr);
+			nsim_mac_record_frame(ns, curr, slen, txq_idx, true);
+			nsim_dev_hwstats_record(dev, slen, true);
+			if (unlikely(nsim_forward_skb(peer_dev, curr, rq, rxq,
+						      rss_hash, rss_type,
+						      psp_ext) ==
+				     NET_RX_DROP)) {
+				u64_stats_update_begin(&ns->syncp);
+				u64_stats_inc(&ns->tx_dropped);
+				u64_stats_update_end(&ns->syncp);
+			} else {
+				pkts++;
+				bytes += slen;
+			}
+		}
+		if (psp_ext)
+			__skb_ext_put(psp_ext);
+
+		if (pkts) {
+			dev_sw_netstats_tx_add(dev, pkts, bytes);
+			if (ns->txq) {
+				WRITE_ONCE(ns->txq[txq_idx].packets,
+					   ns->txq[txq_idx].packets + pkts);
+				WRITE_ONCE(ns->txq[txq_idx].bytes,
+					   ns->txq[txq_idx].bytes + bytes);
+				WRITE_ONCE(ns->txq[txq_idx].hw_gso_packets,
+					   ns->txq[txq_idx].hw_gso_packets + 1);
+				WRITE_ONCE(ns->txq[txq_idx].hw_gso_wire_packets,
+					   ns->txq[txq_idx].hw_gso_wire_packets +
+					   pkts);
+			}
+		}
+		rcu_read_unlock();
+		return NETDEV_TX_OK;
+	}
+
+	if (!was_gso)
+		nsim_tx_csum_complete(skb);
+
+	nsim_mac_record_frame(ns, skb, len, txq_idx, true);
+	nsim_dev_hwstats_record(dev, len, true);
+
+	if (unlikely(nsim_forward_skb(peer_dev, skb, rq, rxq,
+				      rss_hash, rss_type, psp_ext) == NET_RX_DROP))
+		goto out_drop_cnt;
 
 	rcu_read_unlock();
-	dev_dstats_tx_add(dev, len);
-	for (i = 1; i < pkts; i++)
-		dev_dstats_tx_add(dev, 0);
+	dev_sw_netstats_tx_add(dev, gso_segs, len);
+	if (ns->txq) {
+		WRITE_ONCE(ns->txq[txq_idx].packets,
+			   ns->txq[txq_idx].packets + gso_segs);
+		WRITE_ONCE(ns->txq[txq_idx].bytes,
+			   ns->txq[txq_idx].bytes + len);
+		if (was_gso) {
+			WRITE_ONCE(ns->txq[txq_idx].hw_gso_packets,
+				   ns->txq[txq_idx].hw_gso_packets + 1);
+			WRITE_ONCE(ns->txq[txq_idx].hw_gso_wire_packets,
+				   ns->txq[txq_idx].hw_gso_wire_packets +
+				   gso_segs);
+		}
+	}
 	return NETDEV_TX_OK;
 
-out_drop_any:
-	dr = SKB_DROP_REASON_NOT_SPECIFIED;
 out_drop_free:
 	kfree_skb_reason(skb, dr);
 out_drop_cnt:
 	rcu_read_unlock();
-	dev_dstats_tx_dropped(dev);
+	u64_stats_update_begin(&ns->syncp);
+	u64_stats_inc(&ns->tx_dropped);
+	u64_stats_update_end(&ns->syncp);
 	return NETDEV_TX_OK;
 }
 
 static netdev_tx_t nsim_start_xmit_vf(struct sk_buff *skb,
 				      struct net_device *dev)
 {
-	dev_dstats_tx_dropped(dev);
-	kfree_skb(skb);
+	struct netdevsim *ns = netdev_priv(dev);
+	unsigned int len = skb->len;
+	unsigned int vf_id;
+
+	if (ns->nsim_dev_port &&
+	    ns->nsim_dev_port->port_index >= NSIM_DEV_VF_PORT_INDEX_BASE) {
+		vf_id = ns->nsim_dev_port->port_index -
+			NSIM_DEV_VF_PORT_INDEX_BASE;
+		if (vf_id < ns->nsim_dev->nsim_bus_dev->num_vfs) {
+			struct net_device *vf_dev =
+				READ_ONCE(ns->nsim_dev->vf_netdevs[vf_id]);
+
+			if (vf_dev &&
+			    __dev_forward_skb(vf_dev, skb) == NET_RX_SUCCESS) {
+				netif_receive_skb(skb);
+				dev_sw_netstats_tx_add(dev, 1, len);
+				dev_sw_netstats_rx_add(vf_dev, len);
+				return NETDEV_TX_OK;
+			}
+			u64_stats_update_begin(&ns->syncp);
+			u64_stats_inc(&ns->tx_dropped);
+			u64_stats_update_end(&ns->syncp);
+			return NETDEV_TX_OK;
+		}
+	}
+
+	dev_kfree_skb(skb);
+	u64_stats_update_begin(&ns->syncp);
+	u64_stats_inc(&ns->tx_dropped);
+	u64_stats_update_end(&ns->syncp);
 	return NETDEV_TX_OK;
 }
 
@@ -522,12 +1632,49 @@ static int nsim_change_mtu(struct net_device *dev, int new_mtu)
 	return 0;
 }
 
+static void
+nsim_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	u64 rx_pkts = ns->base_rx_packets;
+	u64 rx_bytes = ns->base_rx_bytes;
+	u64 tx_pkts = 0;
+	u64 tx_bytes = 0;
+	unsigned int i;
+
+	rcu_read_lock();
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		if (ns->rq && ns->rq[i]) {
+			rx_pkts += READ_ONCE(ns->rq[i]->rx_packets);
+			rx_bytes += READ_ONCE(ns->rq[i]->rx_bytes);
+		}
+	}
+	for (i = 0; i < dev->num_tx_queues; i++) {
+		if (ns->txq) {
+			tx_pkts += READ_ONCE(ns->txq[i].packets);
+			tx_bytes += READ_ONCE(ns->txq[i].bytes);
+		}
+	}
+	stats->rx_packets = rx_pkts;
+	stats->rx_bytes = rx_bytes;
+	stats->tx_packets = tx_pkts;
+	stats->tx_bytes = tx_bytes;
+	stats->tx_dropped = u64_stats_read(&ns->tx_dropped);
+	rcu_read_unlock();
+}
+
+static int
+nsim_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+		       void *cb_priv)
+{
+	return nsim_bpf_setup_tc_block_cb(type, type_data, cb_priv);
+}
+
 static int nsim_set_vf_mac(struct net_device *dev, int vf, u8 *mac)
 {
 	struct netdevsim *ns = netdev_priv(dev);
 	struct nsim_dev *nsim_dev = ns->nsim_dev;
 
-	/* Only refuse multicast addresses, zero address can mean unset/any. */
 	if (vf >= nsim_dev_get_vfs(nsim_dev) || is_multicast_ether_addr(mac))
 		return -EINVAL;
 	memcpy(nsim_dev->vfconfigs[vf].vf_mac, mac, ETH_ALEN);
@@ -557,7 +1704,7 @@ static int nsim_set_vf_rate(struct net_device *dev, int vf, int min, int max)
 	struct nsim_dev *nsim_dev = ns->nsim_dev;
 
 	if (nsim_esw_mode_is_switchdev(ns->nsim_dev)) {
-		pr_err("Not supported in switchdev mode. Please use devlink API.\n");
+		pr_err("Not supported in switchdev mode.Please use devlink API.\n");
 		return -EOPNOTSUPP;
 	}
 
@@ -652,6 +1799,55 @@ static int nsim_set_vf_link_state(struct net_device *dev, int vf, int state)
 	return 0;
 }
 
+static void nsim_taprio_stats(struct tc_taprio_qopt_stats *stats)
+{
+	stats->window_drops = 0;
+	stats->tx_overruns = 0;
+}
+
+static int nsim_setup_tc_taprio(struct net_device *dev,
+				struct tc_taprio_qopt_offload *offload)
+{
+	int err = 0;
+
+	switch (offload->cmd) {
+	case TAPRIO_CMD_REPLACE:
+	case TAPRIO_CMD_DESTROY:
+		break;
+	case TAPRIO_CMD_STATS:
+		nsim_taprio_stats(&offload->stats);
+		break;
+	default:
+		err = -EOPNOTSUPP;
+	}
+
+	return err;
+}
+
+static LIST_HEAD(nsim_block_cb_list);
+
+static int
+nsim_ndo_setup_tc(struct net_device *dev, enum tc_setup_type type,
+		  void *type_data)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+
+	switch (type) {
+	case TC_SETUP_QDISC_TAPRIO:
+		return nsim_setup_tc_taprio(dev, type_data);
+	case TC_SETUP_BLOCK:
+		return flow_block_cb_setup_simple(type_data,
+						  &nsim_block_cb_list,
+						  nsim_setup_tc_block_cb,
+						  ns, ns, true);
+	case TC_QUERY_CAPS:
+	case TC_SETUP_QDISC_MQPRIO:
+		return nsim_setup_tc(dev, type, type_data);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
 static int
 nsim_set_features(struct net_device *dev, netdev_features_t features)
 {
@@ -663,15 +1859,34 @@ nsim_set_features(struct net_device *dev, netdev_features_t features)
 	return 0;
 }
 
+static netdev_features_t nsim_fix_features(struct net_device *dev,
+					   netdev_features_t features)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+	unsigned int i;
+
+	if (ns->xdp_hw.prog)
+		features &= ~NETIF_F_GRO_HW;
+
+	for (i = 0; i < dev->num_rx_queues; i++) {
+		if (ns->rq && ns->rq[i] && ns->rq[i]->page_pool &&
+		    page_pool_is_unreadable(ns->rq[i]->page_pool)) {
+			features &= ~NETIF_F_GRO_HW;
+			break;
+		}
+	}
+
+	return features;
+}
+
 static int nsim_get_iflink(const struct net_device *dev)
 {
-	struct netdevsim *nsim, *peer;
+	struct netdevsim *ns = netdev_priv(dev);
+	struct netdevsim *peer;
 	int iflink;
 
-	nsim = netdev_priv(dev);
-
 	rcu_read_lock();
-	peer = rcu_dereference(nsim->peer);
+	peer = rcu_dereference(ns->peer);
 	iflink = peer ? READ_ONCE(peer->netdev->ifindex) :
 			READ_ONCE(dev->ifindex);
 	rcu_read_unlock();
@@ -679,230 +1894,20 @@ static int nsim_get_iflink(const struct net_device *dev)
 	return iflink;
 }
 
-static int nsim_rcv(struct nsim_rq *rq, int budget)
-{
-	struct net_device *dev = rq->napi.dev;
-	struct bpf_prog *xdp_prog;
-	struct netdevsim *ns;
-	struct sk_buff *skb;
-	unsigned int skblen;
-	int i, ret;
-
-	ns = netdev_priv(dev);
-	xdp_prog = READ_ONCE(ns->xdp.prog);
-
-	for (i = 0; i < budget; i++) {
-		if (skb_queue_empty(&rq->skb_queue))
-			break;
-
-		skb = skb_dequeue(&rq->skb_queue);
-
-		if (xdp_prog) {
-			/* skb might be freed directly by XDP, save the len */
-			skblen = skb->len;
-
-			if (skb->ip_summed == CHECKSUM_PARTIAL)
-				skb_checksum_help(skb);
-			ret = do_xdp_generic(xdp_prog, &skb);
-			if (ret != XDP_PASS) {
-				WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
-				WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skblen);
-				dev_dstats_rx_add(dev, skblen);
-				continue;
-			}
-		}
-
-		/* skb might be discard at netif_receive_skb, save the len */
-		skblen = skb->len;
-		WRITE_ONCE(rq->rx_packets, rq->rx_packets + 1);
-		WRITE_ONCE(rq->rx_bytes, rq->rx_bytes + skblen);
-		dev_dstats_rx_add(dev, skblen);
-		napi_gro_receive(&rq->napi, skb);
-	}
-
-	nsim_start_peer_tx_queue(dev, rq);
-	return i;
-}
-
-static int nsim_poll(struct napi_struct *napi, int budget)
-{
-	struct nsim_rq *rq = container_of(napi, struct nsim_rq, napi);
-	int done;
-
-	done = nsim_rcv(rq, budget);
-	if (done < budget)
-		napi_complete_done(napi, done);
-
-	return done;
-}
-
-static int nsim_create_page_pool(struct net_device *dev, struct page_pool **p,
-				 struct napi_struct *napi, int idx,
-				 unsigned int order)
-{
-	struct netdevsim *ns = netdev_priv(dev);
-	struct page_pool_params params = {
-		.order = order,
-		.pool_size = NSIM_RING_SIZE,
-		.max_len = PAGE_SIZE << order,
-		.nid = NUMA_NO_NODE,
-		.dev = &ns->nsim_bus_dev->dev,
-		.napi = napi,
-		.dma_dir = DMA_BIDIRECTIONAL,
-		.netdev = dev,
-		.queue_idx = idx,
-	};
-	struct page_pool *pool;
-
-	if (dev->cfg->hds_config != ETHTOOL_TCP_DATA_SPLIT_DISABLED)
-		params.flags |= PP_FLAG_ALLOW_UNREADABLE_NETMEM;
-	if (ns->nsim_bus_dev->dev.dma_mask && PP_DMA_INDEX_BITS)
-		params.flags |= PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
-
-	pool = page_pool_create(&params);
-	if (IS_ERR(pool))
-		return PTR_ERR(pool);
-
-	*p = pool;
-	return 0;
-}
-
-static int nsim_init_napi(struct netdevsim *ns)
-{
-	struct net_device *dev = ns->netdev;
-	struct nsim_rq *rq;
-	int err, i;
-
-	for (i = 0; i < dev->num_rx_queues; i++) {
-		rq = ns->rq[i];
-
-		netif_napi_add_config_locked(dev, &rq->napi, nsim_poll, i);
-	}
-
-	for (i = 0; i < dev->num_rx_queues; i++) {
-		rq = ns->rq[i];
-
-		err = nsim_create_page_pool(dev, &rq->page_pool, &rq->napi,
-					    i, 0);
-		if (err)
-			goto err_pp_destroy;
-	}
-
-	return 0;
-
-err_pp_destroy:
-	while (i--) {
-		page_pool_destroy(ns->rq[i]->page_pool);
-		ns->rq[i]->page_pool = NULL;
-	}
-
-	for (i = 0; i < dev->num_rx_queues; i++)
-		__netif_napi_del_locked(&ns->rq[i]->napi);
-
-	return err;
-}
-
-static enum hrtimer_restart nsim_napi_schedule(struct hrtimer *timer)
-{
-	struct nsim_rq *rq;
-
-	rq = container_of(timer, struct nsim_rq, napi_timer);
-	napi_schedule(&rq->napi);
-
-	return HRTIMER_NORESTART;
-}
-
-static void nsim_rq_timer_init(struct nsim_rq *rq)
-{
-	hrtimer_setup(&rq->napi_timer, nsim_napi_schedule, CLOCK_MONOTONIC,
-		      HRTIMER_MODE_REL);
-}
-
-static void nsim_enable_napi(struct netdevsim *ns)
-{
-	struct net_device *dev = ns->netdev;
-	int i;
-
-	for (i = 0; i < dev->num_rx_queues; i++) {
-		struct nsim_rq *rq = ns->rq[i];
-
-		netif_queue_set_napi(dev, i, NETDEV_QUEUE_TYPE_RX, &rq->napi);
-		napi_enable_locked(&rq->napi);
-	}
-}
-
-static int nsim_open(struct net_device *dev)
-{
-	struct netdevsim *ns = netdev_priv(dev);
-	struct netdevsim *peer;
-	int err;
-
-	netdev_assert_locked(dev);
-
-	err = nsim_init_napi(ns);
-	if (err)
-		return err;
-
-	nsim_enable_napi(ns);
-
-	peer = rtnl_dereference(ns->peer);
-	if (peer && netif_running(peer->netdev)) {
-		netif_carrier_on(dev);
-		netif_carrier_on(peer->netdev);
-	}
-
-	return 0;
-}
-
-static void nsim_del_napi(struct netdevsim *ns)
-{
-	struct net_device *dev = ns->netdev;
-	int i;
-
-	for (i = 0; i < dev->num_rx_queues; i++) {
-		struct nsim_rq *rq = ns->rq[i];
-
-		netif_queue_set_napi(dev, i, NETDEV_QUEUE_TYPE_RX, NULL);
-		napi_disable_locked(&rq->napi);
-		__netif_napi_del_locked(&rq->napi);
-	}
-	synchronize_net();
-
-	for (i = 0; i < dev->num_rx_queues; i++) {
-		page_pool_destroy(ns->rq[i]->page_pool);
-		ns->rq[i]->page_pool = NULL;
-	}
-}
-
-static int nsim_stop(struct net_device *dev)
-{
-	struct netdevsim *ns = netdev_priv(dev);
-	struct netdevsim *peer;
-
-	netdev_assert_locked(dev);
-
-	netif_carrier_off(dev);
-	peer = rtnl_dereference(ns->peer);
-	if (peer)
-		netif_carrier_off(peer->netdev);
-
-	nsim_del_napi(ns);
-
-	return 0;
-}
-
 static int nsim_vlan_rx_add_vid(struct net_device *dev, __be16 proto, u16 vid)
 {
 	struct netdevsim *ns = netdev_priv(dev);
 
-	if (vid >= VLAN_N_VID)
-		return -EINVAL;
-
-	if (proto == htons(ETH_P_8021Q))
-		WARN_ON_ONCE(test_and_set_bit(vid, ns->vlan.ctag));
-	else if (proto == htons(ETH_P_8021AD))
-		WARN_ON_ONCE(test_and_set_bit(vid, ns->vlan.stag));
-
+	switch (ntohs(proto)) {
+	case ETH_P_8021Q:
+		set_bit(vid, ns->vlan.ctag);
+		break;
+	case ETH_P_8021AD:
+		set_bit(vid, ns->vlan.stag);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
@@ -910,14 +1915,85 @@ static int nsim_vlan_rx_kill_vid(struct net_device *dev, __be16 proto, u16 vid)
 {
 	struct netdevsim *ns = netdev_priv(dev);
 
-	if (vid >= VLAN_N_VID)
+	switch (ntohs(proto)) {
+	case ETH_P_8021Q:
+		clear_bit(vid, ns->vlan.ctag);
+		break;
+	case ETH_P_8021AD:
+		clear_bit(vid, ns->vlan.stag);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+static int nsim_hwtstamp_get(struct net_device *dev,
+			     struct kernel_hwtstamp_config *cfg)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+
+	*cfg = ns->hwtstamp_cfg;
+	return 0;
+}
+
+static int nsim_hwtstamp_set(struct net_device *dev,
+			     struct kernel_hwtstamp_config *cfg,
+			     struct netlink_ext_ack *extack)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+
+	switch (cfg->tx_type) {
+	case HWTSTAMP_TX_OFF:
+	case HWTSTAMP_TX_ON:
+		break;
+	default:
+		return -ERANGE;
+	}
+
+	switch (cfg->rx_filter) {
+	case HWTSTAMP_FILTER_NONE:
+	case HWTSTAMP_FILTER_ALL:
+		break;
+	default:
+		cfg->rx_filter = HWTSTAMP_FILTER_ALL;
+		break;
+	}
+
+	ns->hwtstamp_cfg = *cfg;
+	return 0;
+}
+
+static int nsim_ndo_xdp_xmit(struct net_device *dev, int n,
+			     struct xdp_frame **frames, u32 flags)
+{
+	int i, nxmit = 0;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
 		return -EINVAL;
 
-	if (proto == htons(ETH_P_8021Q))
-		WARN_ON_ONCE(!test_and_clear_bit(vid, ns->vlan.ctag));
-	else if (proto == htons(ETH_P_8021AD))
-		WARN_ON_ONCE(!test_and_clear_bit(vid, ns->vlan.stag));
+	for (i = 0; i < n; i++) {
+		struct xdp_frame *xdpf = frames[i];
+		struct sk_buff *skb;
 
+		skb = xdp_build_skb_from_frame(xdpf, dev);
+		if (!skb)
+			break;
+		__skb_push(skb, ETH_HLEN);
+		nsim_start_xmit(skb, dev);
+		nxmit++;
+	}
+	return nxmit;
+}
+
+static int nsim_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+
+	if (qid >= dev->real_num_rx_queues)
+		return -EINVAL;
+
+	nsim_schedule_rq_napi(ns, qid, ns->rq[qid]);
 	return 0;
 }
 
@@ -959,11 +2035,14 @@ static const struct net_shaper_ops nsim_shaper_ops = {
 };
 
 static const struct net_device_ops nsim_netdev_ops = {
+	.ndo_open		= nsim_open,
+	.ndo_stop		= nsim_stop,
 	.ndo_start_xmit		= nsim_start_xmit,
 	.ndo_set_rx_mode_async	= nsim_set_rx_mode,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= nsim_change_mtu,
+	.ndo_get_stats64	= nsim_get_stats64,
 	.ndo_set_vf_mac		= nsim_set_vf_mac,
 	.ndo_set_vf_vlan	= nsim_set_vf_vlan,
 	.ndo_set_vf_rate	= nsim_set_vf_rate,
@@ -972,14 +2051,17 @@ static const struct net_device_ops nsim_netdev_ops = {
 	.ndo_get_vf_config	= nsim_get_vf_config,
 	.ndo_set_vf_link_state	= nsim_set_vf_link_state,
 	.ndo_set_vf_rss_query_en = nsim_set_vf_rss_query_en,
-	.ndo_setup_tc		= nsim_setup_tc,
+	.ndo_setup_tc		= nsim_ndo_setup_tc,
 	.ndo_set_features	= nsim_set_features,
-	.ndo_get_iflink		= nsim_get_iflink,
-	.ndo_bpf		= nsim_bpf,
-	.ndo_open		= nsim_open,
-	.ndo_stop		= nsim_stop,
+	.ndo_fix_features	= nsim_fix_features,
 	.ndo_vlan_rx_add_vid	= nsim_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= nsim_vlan_rx_kill_vid,
+	.ndo_hwtstamp_get	= nsim_hwtstamp_get,
+	.ndo_hwtstamp_set	= nsim_hwtstamp_set,
+	.ndo_bpf		= nsim_bpf,
+	.ndo_xdp_xmit		= nsim_ndo_xdp_xmit,
+	.ndo_xsk_wakeup		= nsim_xsk_wakeup,
+	.ndo_get_iflink		= nsim_get_iflink,
 	.net_shaper_ops		= &nsim_shaper_ops,
 };
 
@@ -989,14 +2071,14 @@ static const struct net_device_ops nsim_vf_netdev_ops = {
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= nsim_change_mtu,
-	.ndo_setup_tc		= nsim_setup_tc,
+	.ndo_setup_tc		= nsim_ndo_setup_tc,
 	.ndo_set_features	= nsim_set_features,
 	.ndo_vlan_rx_add_vid	= nsim_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= nsim_vlan_rx_kill_vid,
 };
 
-/* We don't have true per-queue stats, yet, so do some random fakery here.
- * Only report stuff for queue 0.
+/* We don't have true per-queue stats, yet, so do some randomikos
+ * pretending data got cleanly Roach'd across all queues.
  */
 static void nsim_get_queue_stats_rx(struct net_device *dev, int idx,
 				    struct netdev_queue_stats_rx *stats)
@@ -1006,18 +2088,20 @@ static void nsim_get_queue_stats_rx(struct net_device *dev, int idx,
 
 	stats->packets = READ_ONCE(rq->rx_packets);
 	stats->bytes = READ_ONCE(rq->rx_bytes);
+	stats->alloc_fail = READ_ONCE(rq->alloc_fail);
+	stats->hw_gro_packets = READ_ONCE(rq->hw_gro.hw_gro_packets);
+	stats->hw_gro_wire_packets = READ_ONCE(rq->hw_gro.hw_gro_wire_packets);
 }
 
 static void nsim_get_queue_stats_tx(struct net_device *dev, int idx,
 				    struct netdev_queue_stats_tx *stats)
 {
-	struct rtnl_link_stats64 rtstats = {};
+	struct netdevsim *ns = netdev_priv(dev);
 
-	if (!idx)
-		dev_get_stats(dev, &rtstats);
-
-	stats->packets = rtstats.tx_packets - !!rtstats.tx_packets;
-	stats->bytes = rtstats.tx_bytes;
+	stats->packets = READ_ONCE(ns->txq[idx].packets);
+	stats->bytes = READ_ONCE(ns->txq[idx].bytes);
+	stats->hw_gso_packets = READ_ONCE(ns->txq[idx].hw_gso_packets);
+	stats->hw_gso_wire_packets = READ_ONCE(ns->txq[idx].hw_gso_wire_packets);
 }
 
 static void nsim_get_base_stats(struct net_device *dev,
@@ -1025,72 +2109,53 @@ static void nsim_get_base_stats(struct net_device *dev,
 				struct netdev_queue_stats_tx *tx)
 {
 	struct netdevsim *ns = netdev_priv(dev);
-	struct rtnl_link_stats64 rtstats = {};
-	u64 q_rx_packets = 0, q_rx_bytes = 0;
-	int i;
+	unsigned int i;
 
-	dev_get_stats(dev, &rtstats);
-	for (i = 0; i < dev->real_num_rx_queues; i++) {
-		q_rx_packets += READ_ONCE(ns->rq[i]->rx_packets);
-		q_rx_bytes += READ_ONCE(ns->rq[i]->rx_bytes);
+	rx->packets = ns->base_rx_packets;
+	rx->bytes = ns->base_rx_bytes;
+	rx->alloc_fail = ns->base_rx_alloc_fail;
+	rx->hw_gro_packets = ns->base_rx_hw_gro_packets;
+	rx->hw_gro_wire_packets = ns->base_rx_hw_gro_wire_packets;
+
+	for (i = dev->real_num_rx_queues; i < dev->num_rx_queues; i++) {
+		struct nsim_rq *rq = ns->rq[i];
+
+		rx->packets += READ_ONCE(rq->rx_packets);
+		rx->bytes += READ_ONCE(rq->rx_bytes);
+		rx->alloc_fail += READ_ONCE(rq->alloc_fail);
+		rx->hw_gro_packets += READ_ONCE(rq->hw_gro.hw_gro_packets);
+		rx->hw_gro_wire_packets +=
+			READ_ONCE(rq->hw_gro.hw_gro_wire_packets);
 	}
 
-	rx->packets = rtstats.rx_packets >= q_rx_packets ?
-		      rtstats.rx_packets - q_rx_packets : 0;
-	rx->bytes = rtstats.rx_bytes >= q_rx_bytes ?
-		    rtstats.rx_bytes - q_rx_bytes : 0;
-	tx->packets = !!rtstats.tx_packets;
+	tx->packets = 0;
 	tx->bytes = 0;
+	tx->hw_gso_packets = 0;
+	tx->hw_gso_wire_packets = 0;
+
+	for (i = dev->real_num_tx_queues; i < dev->num_tx_queues; i++) {
+		tx->packets += READ_ONCE(ns->txq[i].packets);
+		tx->bytes += READ_ONCE(ns->txq[i].bytes);
+		tx->hw_gso_packets += READ_ONCE(ns->txq[i].hw_gso_packets);
+		tx->hw_gso_wire_packets +=
+			READ_ONCE(ns->txq[i].hw_gso_wire_packets);
+	}
 }
 
 static const struct netdev_stat_ops nsim_stat_ops = {
-	.get_queue_stats_tx	= nsim_get_queue_stats_tx,
 	.get_queue_stats_rx	= nsim_get_queue_stats_rx,
+	.get_queue_stats_tx	= nsim_get_queue_stats_tx,
 	.get_base_stats		= nsim_get_base_stats,
 };
 
-static struct nsim_rq *nsim_queue_alloc(void)
-{
-	struct nsim_rq *rq;
-
-	rq = kzalloc_obj(*rq, GFP_KERNEL_ACCOUNT);
-	if (!rq)
-		return NULL;
-
-	skb_queue_head_init(&rq->skb_queue);
-	nsim_rq_timer_init(rq);
-	return rq;
-}
-
-static void nsim_queue_free(struct net_device *dev, struct nsim_rq *rq)
-{
-	hrtimer_cancel(&rq->napi_timer);
-
-	if (rq->skb_queue.qlen) {
-		local_bh_disable();
-		dev_dstats_rx_dropped_add(dev, rq->skb_queue.qlen);
-		local_bh_enable();
-	}
-
-	skb_queue_purge_reason(&rq->skb_queue, SKB_DROP_REASON_QUEUE_PURGE);
-	kfree(rq);
-}
-
-/* Queue reset mode is controlled by ns->rq_reset_mode.
- * - normal - new NAPI new pool (old NAPI enabled when new added)
- * - mode 1 - allocate new pool (NAPI is only disabled / enabled)
- * - mode 2 - new NAPI new pool (old NAPI removed before new added)
- * - mode 3 - new NAPI new pool (old NAPI disabled when new added)
- */
 struct nsim_queue_mem {
 	struct nsim_rq *rq;
 	struct page_pool *pp;
 };
 
-static int
-nsim_queue_mem_alloc(struct net_device *dev,
-		     struct netdev_queue_config *qcfg,
-		     void *per_queue_mem, int idx)
+static int nsim_queue_mem_alloc(struct net_device *dev,
+				struct netdev_queue_config *qcfg,
+				void *per_queue_mem, int idx)
 {
 	unsigned int order = qcfg->rx_page_size ?
 			     get_order(qcfg->rx_page_size) : 0;
@@ -1112,7 +2177,7 @@ nsim_queue_mem_alloc(struct net_device *dev,
 					     &ns->rq[idx]->napi, idx, order);
 	}
 
-	qmem->rq = nsim_queue_alloc();
+	qmem->rq = nsim_queue_alloc(dev);
 	if (!qmem->rq)
 		return -ENOMEM;
 
@@ -1121,9 +2186,11 @@ nsim_queue_mem_alloc(struct net_device *dev,
 	if (err)
 		goto err_free;
 
-	if (!ns->rq_reset_mode)
+	if (!ns->rq_reset_mode) {
 		netif_napi_add_config_locked(dev, &qmem->rq->napi, nsim_poll,
 					     idx);
+		nsim_init_irq(qmem->rq, idx);
+	}
 
 	return 0;
 
@@ -1141,19 +2208,24 @@ static void nsim_queue_mem_free(struct net_device *dev, void *per_queue_mem)
 	if (qmem->rq) {
 		struct page_pool *pp = qmem->rq->page_pool;
 
-		if (!ns->rq_reset_mode)
+		if (xdp_rxq_info_is_reg(&qmem->rq->xdp_rxq))
+			xdp_rxq_info_unreg(&qmem->rq->xdp_rxq);
+		if (!ns->rq_reset_mode) {
+			nsim_free_irq(qmem->rq);
 			netif_napi_del_locked(&qmem->rq->napi);
+		}
 		nsim_queue_free(dev, qmem->rq);
 		page_pool_destroy(pp);
 	}
 }
 
-static int
-nsim_queue_start(struct net_device *dev, struct netdev_queue_config *qcfg,
-		 void *per_queue_mem, int idx)
+static int nsim_queue_start(struct net_device *dev,
+			    struct netdev_queue_config *qcfg,
+			    void *per_queue_mem, int idx)
 {
 	struct nsim_queue_mem *qmem = per_queue_mem;
 	struct netdevsim *ns = netdev_priv(dev);
+	int err;
 
 	netdev_assert_locked(dev);
 
@@ -1163,22 +2235,41 @@ nsim_queue_start(struct net_device *dev, struct netdev_queue_config *qcfg,
 		return 0;
 	}
 
-	/* netif_napi_add()/_del() should normally be called from alloc/free,
-	 * here we want to test various call orders.
-	 */
 	if (ns->rq_reset_mode == 2) {
+		nsim_free_irq(ns->rq[idx]);
 		netif_napi_del_locked(&ns->rq[idx]->napi);
 		netif_napi_add_config_locked(dev, &qmem->rq->napi, nsim_poll,
 					     idx);
+		nsim_init_irq(qmem->rq, idx);
 	} else if (ns->rq_reset_mode == 3) {
 		netif_napi_add_config_locked(dev, &qmem->rq->napi, nsim_poll,
 					     idx);
+		nsim_init_irq(qmem->rq, idx);
+		nsim_free_irq(ns->rq[idx]);
 		netif_napi_del_locked(&ns->rq[idx]->napi);
 	}
 
 	qmem->rq->rx_packets = ns->rq[idx]->rx_packets;
 	qmem->rq->rx_bytes = ns->rq[idx]->rx_bytes;
+	qmem->rq->alloc_fail = ns->rq[idx]->alloc_fail;
+	qmem->rq->hw_gro.hw_gro_packets = ns->rq[idx]->hw_gro.hw_gro_packets;
+	qmem->rq->hw_gro.hw_gro_wire_packets =
+		ns->rq[idx]->hw_gro.hw_gro_wire_packets;
+	qmem->rq->xsk_pool = ns->rq[idx]->xsk_pool;
 	ns->rq[idx] = qmem->rq;
+
+	err = xdp_rxq_info_reg(&ns->rq[idx]->xdp_rxq, dev, idx,
+			       ns->rq[idx]->napi.napi_id);
+	if (!err) {
+		if (ns->rq[idx]->xsk_pool)
+			xsk_pool_set_rxq_info(ns->rq[idx]->xsk_pool,
+					      &ns->rq[idx]->xdp_rxq);
+		else
+			WARN_ON(xdp_rxq_info_reg_mem_model(&ns->rq[idx]->xdp_rxq,
+							   MEM_TYPE_PAGE_POOL,
+							   ns->rq[idx]->page_pool));
+	}
+
 	netif_queue_set_napi(dev, idx, NETDEV_QUEUE_TYPE_RX, &ns->rq[idx]->napi);
 	napi_enable_locked(&ns->rq[idx]->napi);
 
@@ -1204,13 +2295,43 @@ static int nsim_queue_stop(struct net_device *dev, void *per_queue_mem, int idx)
 	return 0;
 }
 
+static void
+nsim_default_qcfg(struct net_device *dev, struct netdev_queue_config *qcfg)
+{
+	qcfg->rx_page_size = PAGE_SIZE;
+}
+
+static int
+nsim_validate_qcfg(struct net_device *dev, struct netdev_queue_config *qcfg,
+		   struct netlink_ext_ack *extack)
+{
+	if (!is_power_of_2(qcfg->rx_page_size) ||
+	    qcfg->rx_page_size < PAGE_SIZE ||
+	    qcfg->rx_page_size > (PAGE_SIZE << 2)) {
+		NL_SET_ERR_MSG_MOD(extack, "Invalid rx page size");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static struct device *
+nsim_queue_get_dma_dev(struct net_device *dev, int idx)
+{
+	struct netdevsim *ns = netdev_priv(dev);
+
+	return &ns->nsim_bus_dev->dev;
+}
+
 static const struct netdev_queue_mgmt_ops nsim_queue_mgmt_ops = {
-	.supported_params	= QCFG_RX_PAGE_SIZE,
 	.ndo_queue_mem_size	= sizeof(struct nsim_queue_mem),
 	.ndo_queue_mem_alloc	= nsim_queue_mem_alloc,
 	.ndo_queue_mem_free	= nsim_queue_mem_free,
 	.ndo_queue_start	= nsim_queue_start,
 	.ndo_queue_stop		= nsim_queue_stop,
+	.ndo_default_qcfg	= nsim_default_qcfg,
+	.ndo_validate_qcfg	= nsim_validate_qcfg,
+	.ndo_queue_get_dma_dev	= nsim_queue_get_dma_dev,
+	.supported_params	= QCFG_RX_PAGE_SIZE,
 };
 
 static ssize_t
@@ -1335,20 +2456,31 @@ static void nsim_setup(struct net_device *dev)
 	ether_setup(dev);
 	eth_hw_addr_random(dev);
 
-	dev->flags &= ~IFF_MULTICAST;
-	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+	dev->tx_queue_len = 0;
+	dev->flags |= IFF_BROADCAST | IFF_MULTICAST;
+	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE |
+			   IFF_NO_QUEUE;
 	dev->features |= NETIF_F_HIGHDMA |
 			 NETIF_F_SG |
 			 NETIF_F_FRAGLIST |
 			 NETIF_F_HW_CSUM |
 			 NETIF_F_RXCSUM |
 			 NETIF_F_RXHASH |
-			 NETIF_F_LRO |
-			 NETIF_F_TSO |
-			 NETIF_F_TSO6 |
-			 NETIF_F_GSO_UDP_L4 |
-			 NETIF_F_GRO_FRAGLIST |
+			 NETIF_F_GSO_SOFTWARE |
+			 NETIF_F_GSO_ROBUST |
+			 NETIF_F_GSO_PARTIAL |
+			 NETIF_F_TSO_MANGLEID |
+			 NETIF_F_GSO_UDP_TUNNEL |
+			 NETIF_F_GSO_UDP_TUNNEL_CSUM |
+			 NETIF_F_GSO_GRE |
+			 NETIF_F_GSO_GRE_CSUM |
+			 NETIF_F_GSO_IPXIP4 |
+			 NETIF_F_GSO_IPXIP6 |
 			 NETIF_F_NTUPLE |
+			 NETIF_F_HW_VLAN_CTAG_TX |
+			 NETIF_F_HW_VLAN_CTAG_RX |
+			 NETIF_F_HW_VLAN_STAG_TX |
+			 NETIF_F_HW_VLAN_STAG_RX |
 			 NETIF_F_HW_VLAN_CTAG_FILTER |
 			 NETIF_F_HW_VLAN_STAG_FILTER;
 	dev->hw_features |= NETIF_F_HW_TC |
@@ -1358,17 +2490,52 @@ static void nsim_setup(struct net_device *dev)
 			    NETIF_F_RXCSUM |
 			    NETIF_F_RXHASH |
 			    NETIF_F_LRO |
-			    NETIF_F_TSO |
-			    NETIF_F_TSO6 |
-			    NETIF_F_GSO_UDP_L4 |
+			    NETIF_F_GRO_HW |
 			    NETIF_F_GRO_FRAGLIST |
+			    NETIF_F_GSO_SOFTWARE |
+			    NETIF_F_GSO_ROBUST |
+			    NETIF_F_GSO_PARTIAL |
+			    NETIF_F_TSO_MANGLEID |
+			    NETIF_F_GSO_UDP_TUNNEL |
+			    NETIF_F_GSO_UDP_TUNNEL_CSUM |
+			    NETIF_F_GSO_GRE |
+			    NETIF_F_GSO_GRE_CSUM |
+			    NETIF_F_GSO_IPXIP4 |
+			    NETIF_F_GSO_IPXIP6 |
 			    NETIF_F_LOOPBACK |
 			    NETIF_F_NTUPLE |
+			    NETIF_F_HW_VLAN_CTAG_TX |
+			    NETIF_F_HW_VLAN_CTAG_RX |
+			    NETIF_F_HW_VLAN_STAG_TX |
+			    NETIF_F_HW_VLAN_STAG_RX |
 			    NETIF_F_HW_VLAN_CTAG_FILTER |
 			    NETIF_F_HW_VLAN_STAG_FILTER;
-	dev->pcpu_stat_type = NETDEV_PCPU_STAT_DSTATS;
+	dev->vlan_features |= dev->features &
+			      ~(NETIF_F_HW_VLAN_CTAG_TX |
+				NETIF_F_HW_VLAN_CTAG_RX |
+				NETIF_F_HW_VLAN_STAG_TX |
+				NETIF_F_HW_VLAN_STAG_RX |
+				NETIF_F_HW_VLAN_CTAG_FILTER |
+				NETIF_F_HW_VLAN_STAG_FILTER);
+	dev->hw_enc_features |= dev->features;
+	dev->gso_partial_features |= NETIF_F_GSO_GRE |
+				     NETIF_F_GSO_GRE_CSUM |
+				     NETIF_F_GSO_IPXIP4 |
+				     NETIF_F_GSO_IPXIP6 |
+				     NETIF_F_GSO_UDP_TUNNEL |
+				     NETIF_F_GSO_UDP_TUNNEL_CSUM;
+	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 	dev->max_mtu = ETH_MAX_MTU;
-	dev->xdp_features = NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_HW_OFFLOAD;
+	netif_set_tso_max_size(dev, 262144);
+	dev->xdp_features = NETDEV_XDP_ACT_BASIC |
+			    NETDEV_XDP_ACT_REDIRECT |
+			    NETDEV_XDP_ACT_NDO_XMIT |
+			    NETDEV_XDP_ACT_XSK_ZEROCOPY |
+			    NETDEV_XDP_ACT_RX_SG |
+			    NETDEV_XDP_ACT_NDO_XMIT_SG |
+			    NETDEV_XDP_ACT_HW_OFFLOAD;
+	dev->xdp_zc_max_segs = MAX_SKB_FRAGS;
+	dev->xdp_metadata_ops = &nsim_xdp_metadata_ops;
 }
 
 static int nsim_queue_init(struct netdevsim *ns)
@@ -1376,12 +2543,20 @@ static int nsim_queue_init(struct netdevsim *ns)
 	struct net_device *dev = ns->netdev;
 	int i;
 
-	ns->rq = kzalloc_objs(*ns->rq, dev->num_rx_queues, GFP_KERNEL_ACCOUNT);
+	ns->rq = kcalloc(dev->num_rx_queues, sizeof(*ns->rq),
+			 GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 	if (!ns->rq)
 		return -ENOMEM;
 
+	ns->txq = kcalloc(dev->num_tx_queues, sizeof(*ns->txq),
+			  GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!ns->txq) {
+		kfree(ns->rq);
+		return -ENOMEM;
+	}
+
 	for (i = 0; i < dev->num_rx_queues; i++) {
-		ns->rq[i] = nsim_queue_alloc();
+		ns->rq[i] = nsim_queue_alloc(dev);
 		if (!ns->rq[i])
 			goto err_free_prev;
 	}
@@ -1390,7 +2565,8 @@ static int nsim_queue_init(struct netdevsim *ns)
 
 err_free_prev:
 	while (i--)
-		kfree(ns->rq[i]);
+		nsim_queue_free(dev, ns->rq[i]);
+	kfree(ns->txq);
 	kfree(ns->rq);
 	return -ENOMEM;
 }
@@ -1403,13 +2579,14 @@ static void nsim_queue_uninit(struct netdevsim *ns)
 	for (i = 0; i < dev->num_rx_queues; i++)
 		nsim_queue_free(dev, ns->rq[i]);
 
+	kfree(ns->txq);
 	kfree(ns->rq);
 	ns->rq = NULL;
+	ns->txq = NULL;
 }
 
 static int nsim_init_netdevsim(struct netdevsim *ns)
 {
-	struct netdevsim *peer;
 	struct mock_phc *phc;
 	int err;
 
@@ -1431,13 +2608,9 @@ static int nsim_init_netdevsim(struct netdevsim *ns)
 		goto err_phc_destroy;
 
 	rtnl_lock();
-	err = nsim_queue_init(ns);
-	if (err)
-		goto err_utn_destroy;
-
 	err = nsim_bpf_init(ns);
 	if (err)
-		goto err_rq_destroy;
+		goto err_utn_destroy;
 
 	nsim_macsec_init(ns);
 	nsim_ipsec_init(ns);
@@ -1449,30 +2622,17 @@ static int nsim_init_netdevsim(struct netdevsim *ns)
 
 	err = nsim_psp_init(ns);
 	if (err)
-		goto err_unregister_netdev;
-
-	if (IS_ENABLED(CONFIG_DEBUG_NET)) {
-		ns->nb.notifier_call = netdev_debug_event;
-		if (register_netdevice_notifier_dev_net(ns->netdev, &ns->nb,
-							&ns->nn))
-			ns->nb.notifier_call = NULL;
-	}
+		goto err_unreg_netdev;
 
 	return 0;
 
-err_unregister_netdev:
+err_unreg_netdev:
+	unregister_netdev(ns->netdev);
 	rtnl_lock();
-	peer = rtnl_dereference(ns->peer);
-	if (peer)
-		RCU_INIT_POINTER(peer->peer, NULL);
-	RCU_INIT_POINTER(ns->peer, NULL);
-	unregister_netdevice(ns->netdev);
 err_ipsec_teardown:
 	nsim_ipsec_teardown(ns);
 	nsim_macsec_teardown(ns);
 	nsim_bpf_uninit(ns);
-err_rq_destroy:
-	nsim_queue_uninit(ns);
 err_utn_destroy:
 	rtnl_unlock();
 	nsim_udp_tunnels_info_destroy(ns->netdev);
@@ -1486,49 +2646,59 @@ static int nsim_init_netdevsim_vf(struct netdevsim *ns)
 	int err;
 
 	ns->netdev->netdev_ops = &nsim_vf_netdev_ops;
+	ns->netdev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
 	rtnl_lock();
 	err = register_netdevice(ns->netdev);
 	rtnl_unlock();
 	return err;
 }
 
-static void nsim_exit_netdevsim(struct netdevsim *ns)
+struct netdevsim *
+nsim_create(struct nsim_dev *nsim_dev, struct nsim_dev_port *nsim_dev_port,
+	    u8 perm_addr[ETH_ALEN])
 {
-	nsim_udp_tunnels_info_destroy(ns->netdev);
-	mock_phc_destroy(ns->phc);
-}
-
-struct netdevsim *nsim_create(struct nsim_dev *nsim_dev,
-			      struct nsim_dev_port *nsim_dev_port,
-			      u8 perm_addr[ETH_ALEN])
-{
+	const char *ifname = (nsim_dev_port && nsim_dev_port->ifname[0]) ?
+			     nsim_dev_port->ifname : "eth%d";
+	unsigned char name_assign_type =
+		(nsim_dev_port && nsim_dev_port->ifname[0]) ?
+		NET_NAME_PREDICTABLE : NET_NAME_UNKNOWN;
 	struct net_device *dev;
 	struct netdevsim *ns;
 	int err;
 
-	dev = alloc_netdev_mq(sizeof(*ns), "eth%d", NET_NAME_UNKNOWN, nsim_setup,
+	dev = alloc_netdev_mq(sizeof(*ns), ifname, name_assign_type, nsim_setup,
 			      nsim_dev->nsim_bus_dev->num_queues);
 	if (!dev)
 		return ERR_PTR(-ENOMEM);
 
-	if (perm_addr)
+	if (perm_addr) {
 		memcpy(dev->perm_addr, perm_addr, ETH_ALEN);
+		eth_hw_addr_set(dev, perm_addr);
+	}
 
 	dev_net_set(dev, nsim_dev_net(nsim_dev));
 	ns = netdev_priv(dev);
 	ns->netdev = dev;
+	u64_stats_init(&ns->syncp);
+	spin_lock_init(&ns->stats_lock);
 	ns->nsim_dev = nsim_dev;
 	ns->nsim_dev_port = nsim_dev_port;
 	ns->nsim_bus_dev = nsim_dev->nsim_bus_dev;
 	SET_NETDEV_DEV(dev, &ns->nsim_bus_dev->dev);
 	SET_NETDEV_DEVLINK_PORT(dev, &nsim_dev_port->devlink_port);
 	nsim_ethtool_init(ns);
-	if (nsim_dev_port_is_pf(nsim_dev_port))
+	if (nsim_dev_port_is_pf(nsim_dev_port)) {
+		err = nsim_queue_init(ns);
+		if (err)
+			goto err_ethtool_fini;
 		err = nsim_init_netdevsim(ns);
-	else
+		if (err)
+			goto err_queue_uninit;
+	} else {
 		err = nsim_init_netdevsim_vf(ns);
-	if (err)
-		goto err_free_netdev;
+		if (err)
+			goto err_ethtool_fini;
+	}
 
 	ns->pp_dfs = debugfs_create_file("pp_hold", 0600, nsim_dev_port->ddir,
 					 ns, &nsim_pp_hold_fops);
@@ -1537,9 +2707,15 @@ struct netdevsim *nsim_create(struct nsim_dev *nsim_dev,
 					 &nsim_qreset_fops);
 	ns->vlan_dfs = debugfs_create_file("vlan", 0400, nsim_dev_port->ddir,
 					   ns, &nsim_vlan_fops);
+	ns->rq_reset_mode = 0;
+	debugfs_create_u32("rq_reset_mode", 0600, ns->nsim_dev_port->ddir,
+			   &ns->rq_reset_mode);
+
 	return ns;
 
-err_free_netdev:
+err_queue_uninit:
+	nsim_queue_uninit(ns);
+err_ethtool_fini:
 	nsim_ethtool_fini(ns);
 	free_netdev(dev);
 	return ERR_PTR(err);
@@ -1556,28 +2732,28 @@ void nsim_destroy(struct netdevsim *ns)
 	debugfs_remove(ns->pp_dfs);
 	nsim_ethtool_fini(ns);
 
-	if (ns->nb.notifier_call)
-		unregister_netdevice_notifier_dev_net(ns->netdev, &ns->nb,
-						      &ns->nn);
-
 	if (nsim_dev_port_is_pf(ns->nsim_dev_port))
 		nsim_psp_uninit(ns);
 
 	rtnl_lock();
 	peer = rtnl_dereference(ns->peer);
-	if (peer)
+	if (peer) {
 		RCU_INIT_POINTER(peer->peer, NULL);
-	RCU_INIT_POINTER(ns->peer, NULL);
+		RCU_INIT_POINTER(ns->peer, NULL);
+		nsim_update_carrier(peer);
+	}
 	unregister_netdevice(dev);
 	if (nsim_dev_port_is_pf(ns->nsim_dev_port)) {
-		nsim_macsec_teardown(ns);
 		nsim_ipsec_teardown(ns);
+		nsim_macsec_teardown(ns);
 		nsim_bpf_uninit(ns);
 		nsim_queue_uninit(ns);
 	}
 	rtnl_unlock();
-	if (nsim_dev_port_is_pf(ns->nsim_dev_port))
-		nsim_exit_netdevsim(ns);
+	if (nsim_dev_port_is_pf(ns->nsim_dev_port)) {
+		nsim_udp_tunnels_info_destroy(dev);
+		mock_phc_destroy(ns->phc);
+	}
 
 	for_each_set_bit(vid, ns->vlan.ctag, VLAN_N_VID)
 		WARN_ON_ONCE(1);
