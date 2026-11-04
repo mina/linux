@@ -39,9 +39,20 @@ if [ $# -ne 1 ]; then
 fi
 script="$(basename $1)"
 
-if [ -z "$(which packetdrill)" ]; then
+packetdrill_bin="$(which packetdrill)"
+if [ -z "${packetdrill_bin}" ]; then
 	ktap_skip_all "packetdrill not found in PATH"
 	exit "$KSFT_SKIP"
+fi
+
+if [[ -z "${PACKETDRILL_NSIM+x}" ]]; then
+	if [[ ! -d /sys/bus/netdevsim ]]; then
+		modprobe netdevsim 2>/dev/null || true
+	fi
+	if [[ -d /sys/bus/netdevsim ]] && \
+	   grep -qa "PACKETDRILL_NSIM" "${packetdrill_bin}" 2>/dev/null; then
+		export PACKETDRILL_NSIM=1
+	fi
 fi
 
 declare -a optargs
@@ -64,7 +75,12 @@ ktap_print_header
 ktap_set_plan $(echo $ip_versions | wc -w)
 
 for ip_version in $ip_versions; do
-	unshare -n packetdrill ${ip_args[$ip_version]} ${optargs[@]} $script > /dev/null \
+	unshare -mn bash -c '
+		if [[ "${PACKETDRILL_NSIM:-0}" != "0" && -n "${PACKETDRILL_NSIM:-}" ]]; then
+			mount -t sysfs none /sys 2>/dev/null || true
+		fi
+		exec packetdrill "$@"
+	' _ ${ip_args[$ip_version]} ${optargs[@]} $script > /dev/null \
 		&& ktap_test_pass $ip_version || $failfunc $ip_version
 done
 
