@@ -6,6 +6,7 @@ set -e
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 DRIVER="${SCRIPT_DIR}/page_pool/bench_page_pool.ko"
+NSIM_BENCH="${SCRIPT_DIR}/bench_page_pool_nsim.py"
 result=""
 
 function run_test()
@@ -43,6 +44,12 @@ function run_test()
 	if ! echo "${result}" | grep -q "All page_pool benchmarks passed"; then
 		echo "ERROR: page_pool kernel benchmark failed" >&2
 		exit 1
+	fi
+
+	if [ -f "$NSIM_BENCH" ]; then
+		echo
+		echo "netdevsim page_pool & devmem benchmark results:"
+		python3 "$NSIM_BENCH"
 	fi
 
 	echo "[PASS] test_bench_page_pool"
