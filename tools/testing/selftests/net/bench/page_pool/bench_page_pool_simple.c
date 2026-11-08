@@ -29,6 +29,10 @@
 static int verbose = 1;
 
 #define MY_POOL_SIZE		1024
+#define MY_OVERFLOW_BATCH	(PP_ALLOC_CACHE_SIZE + PP_ALLOC_CACHE_REFILL)
+#define MY_RING_SMALL_SIZE	64
+#define MY_RING_OVERFLOW_BATCH	(MY_RING_SMALL_SIZE * 2)
+#define MY_HIGH_ORDER		2
 /* Makes tests selectable. Useful for perf-record to analyze a single test.
  * Hint: Bash shells support writing binary number like: $((2#101010))
  *
@@ -42,6 +46,7 @@ MODULE_PARM_DESC(run_flags, "Bitmask limiting which benchmark groups run");
 enum benchmark_bit {
 	bit_run_bench_bh_fast,
 	bit_run_bench_bh_ring_slow,
+	bit_run_bench_high_order,
 };
 
 #define enabled(b)	(run_flags & BIT(b))
@@ -380,6 +385,144 @@ static int time_bench_bh_slow_alloc(struct time_bench_record *rec, void *data)
 	return time_bench_page_pool_cfg(rec, &cfg, __func__);
 }
 
+static int time_bench_bh_cache_overflow(struct time_bench_record *rec,
+					void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = NUMA_NO_NODE,
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	netmem_ref *batch;
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 outer, j, batches;
+
+	batch = kcalloc(MY_OVERFLOW_BATCH, sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return 0;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp)) {
+		kfree(batch);
+		return 0;
+	}
+
+	batches = max_t(u32, rec->loops / MY_OVERFLOW_BATCH, 8U);
+	rec->loops = batches * MY_OVERFLOW_BATCH;
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (outer = 0; outer < batches; outer++) {
+		u32 got = 0;
+
+		for (j = 0; j < MY_OVERFLOW_BATCH; j++) {
+			batch[j] = page_pool_alloc_netmems(pp, GFP_ATOMIC);
+			if (unlikely(!batch[j]))
+				break;
+			got++;
+		}
+		for (j = 0; j < got; j++)
+			page_pool_recycle_direct_netmem(pp, batch[j]);
+
+		loops_cnt += got;
+		if (unlikely(got < MY_OVERFLOW_BATCH))
+			break;
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (!pp_verify_stats(pp, __func__,
+			     PP_EXPECT_ALLOC_FAST | PP_EXPECT_ALLOC_REFILL |
+			     PP_EXPECT_RECYCLE_CACHED |
+			     PP_EXPECT_RECYCLE_CACHE_FULL |
+			     PP_EXPECT_RECYCLE_RING))
+		loops_cnt = 0;
+
+	page_pool_destroy(pp);
+	kfree(batch);
+	return loops_cnt;
+}
+
+static int time_bench_bh_ring_full(struct time_bench_record *rec, void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_RING_SMALL_SIZE,
+		.nid = NUMA_NO_NODE,
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	netmem_ref *batch;
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 outer, j, batches;
+
+	batch = kcalloc(MY_RING_OVERFLOW_BATCH, sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return 0;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp)) {
+		kfree(batch);
+		return 0;
+	}
+
+	batches = max_t(u32, rec->loops / MY_RING_OVERFLOW_BATCH, 16U);
+	rec->loops = batches * MY_RING_OVERFLOW_BATCH;
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (outer = 0; outer < batches; outer++) {
+		u32 got = 0;
+
+		for (j = 0; j < MY_RING_OVERFLOW_BATCH; j++) {
+			batch[j] = page_pool_alloc_netmems(pp, GFP_ATOMIC);
+			if (unlikely(!batch[j]))
+				break;
+			got++;
+		}
+		for (j = 0; j < got; j++)
+			page_pool_put_full_netmem(pp, batch[j], false);
+
+		loops_cnt += got;
+		if (unlikely(got < MY_RING_OVERFLOW_BATCH))
+			break;
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (!pp_verify_stats(pp, __func__,
+			     PP_EXPECT_ALLOC_EMPTY | PP_EXPECT_ALLOC_SLOW |
+			     PP_EXPECT_RECYCLE_RING |
+			     PP_EXPECT_RECYCLE_RING_FULL))
+		loops_cnt = 0;
+
+	page_pool_destroy(pp);
+	kfree(batch);
+	return loops_cnt;
+}
+
+static int time_bench_high_order_fast(struct time_bench_record *rec, void *data)
+{
+	struct pp_bench_cfg cfg = {
+		.type = type_fast_path,
+		.order = MY_HIGH_ORDER,
+	};
+
+	return time_bench_page_pool_cfg(rec, &cfg, __func__);
+}
+
+static int time_bench_high_order_ring(struct time_bench_record *rec, void *data)
+{
+	struct pp_bench_cfg cfg = {
+		.type = type_ptr_ring,
+		.order = MY_HIGH_ORDER,
+	};
+
+	return time_bench_page_pool_cfg(rec, &cfg, __func__);
+}
+
 static int run_benchmark_tests(void)
 {
 	u32 nr_loops = loops;
@@ -398,9 +541,24 @@ static int run_benchmark_tests(void)
 	if (enabled(bit_run_bench_bh_ring_slow)) {
 		run_bench_case(nr_loops, 0, "bh-ptr-ring", NULL,
 			       time_bench_bh_ptr_ring);
+		run_bench_case(roundup(nr_loops, MY_OVERFLOW_BATCH),
+			       MY_OVERFLOW_BATCH, "bh-cache-overflow-refill",
+			       NULL, time_bench_bh_cache_overflow);
+		run_bench_case(roundup(scale_slow_loops(nr_loops, 16),
+				       MY_RING_OVERFLOW_BATCH),
+			       MY_RING_OVERFLOW_BATCH, "bh-ring-full-return",
+			       NULL, time_bench_bh_ring_full);
 		run_bench_case(scale_slow_loops(nr_loops, 16), 0,
 			       "bh-slow-page-alloc", NULL,
 			       time_bench_bh_slow_alloc);
+	}
+
+	/* High-order compound pages (order=2, 16KB) */
+	if (enabled(bit_run_bench_high_order)) {
+		run_bench_case(nr_loops, 0, "bh-high-order-fast", NULL,
+			       time_bench_high_order_fast);
+		run_bench_case(nr_loops, 0, "bh-high-order-ptr-ring", NULL,
+			       time_bench_high_order_ring);
 	}
 
 	if (bench_failures) {
