@@ -211,18 +211,18 @@ static inline int netmem_ref_count(netmem_ref netmem)
 	/* The non-pp refcount of net_iov is always 1. On net_iov, we only
 	 * support pp refcounting which uses the pp_ref_count field.
 	 */
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return 1;
 
-	return page_ref_count(netmem_to_page(netmem));
+	return page_ref_count(__netmem_to_page(netmem));
 }
 
 static inline unsigned long netmem_pfn_trace(netmem_ref netmem)
 {
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return 0;
 
-	return page_to_pfn(netmem_to_page(netmem));
+	return page_to_pfn(__netmem_to_page(netmem));
 }
 
 /* XXX: How to extract netmem_desc from page must be changed, once
@@ -272,12 +272,9 @@ static inline struct netmem_desc *__netmem_to_nmdesc(netmem_ref netmem)
  */
 static inline struct netmem_desc *netmem_to_nmdesc(netmem_ref netmem)
 {
-	void *p = (void *)((__force unsigned long)netmem & ~NET_IOV);
+	static_assert(offsetof(struct net_iov, desc) == 0);
 
-	if (netmem_is_net_iov(netmem))
-		return &((struct net_iov *)p)->desc;
-
-	return __pp_page_to_nmdesc((struct page *)p);
+	return (struct netmem_desc *)((__force unsigned long)netmem & ~NET_IOV);
 }
 
 /**
@@ -311,19 +308,19 @@ static inline bool netmem_is_pref_nid(netmem_ref netmem, int pref_nid)
 	/* NUMA node preference only applies to struct page; net_iovs are
 	 * managed by their memory provider.
 	 */
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return true;
 
-	return page_to_nid(netmem_to_page(netmem)) == pref_nid;
+	return page_to_nid(__netmem_to_page(netmem)) == pref_nid;
 }
 
 static inline netmem_ref netmem_compound_head(netmem_ref netmem)
 {
 	/* niov are never compounded */
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return netmem;
 
-	return page_to_netmem(compound_head(netmem_to_page(netmem)));
+	return page_to_netmem(compound_head(__netmem_to_page(netmem)));
 }
 
 /**
@@ -344,7 +341,7 @@ static inline void *__netmem_address(netmem_ref netmem)
 
 static inline void *netmem_address(netmem_ref netmem)
 {
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return NULL;
 
 	return __netmem_address(netmem);
@@ -359,10 +356,10 @@ static inline void *netmem_address(netmem_ref netmem)
  */
 static inline bool netmem_is_pfmemalloc(netmem_ref netmem)
 {
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return false;
 
-	return page_is_pfmemalloc(netmem_to_page(netmem));
+	return page_is_pfmemalloc(__netmem_to_page(netmem));
 }
 
 #define NETMEM_32BIT_ARCH_WITH_64BIT_DMA	\
@@ -422,10 +419,10 @@ void net_iov_dec_ref(struct net_iov *niov);
  */
 static __always_inline void netmem_inc_ref(netmem_ref netmem)
 {
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		net_iov_inc_ref(netmem_to_net_iov(netmem));
 	else
-		get_page(netmem_to_page(netmem));
+		get_page(__netmem_to_page(netmem));
 }
 
 /**
@@ -438,10 +435,10 @@ static __always_inline void netmem_inc_ref(netmem_ref netmem)
  */
 static __always_inline void netmem_dec_ref(netmem_ref netmem)
 {
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		net_iov_dec_ref(netmem_to_net_iov(netmem));
 	else
-		put_page(netmem_to_page(netmem));
+		put_page(__netmem_to_page(netmem));
 }
 
 #define netmem_dma_unmap_addr_set(NETMEM, PTR, ADDR_NAME, VAL)   \

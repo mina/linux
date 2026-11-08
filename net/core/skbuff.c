@@ -1045,7 +1045,9 @@ bool napi_pp_put_page(netmem_ref netmem)
 	if (unlikely(!netmem_is_pp(netmem)))
 		return false;
 
-	page_pool_put_full_netmem(netmem_get_pp(netmem), netmem, false);
+	if (page_pool_unref_and_test(netmem))
+		page_pool_put_unrefed_netmem(netmem_get_pp(netmem), netmem, -1,
+					     false);
 
 	return true;
 }
