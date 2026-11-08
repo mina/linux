@@ -35,6 +35,8 @@ static int verbose = 1;
 #define MY_RING_OVERFLOW_BATCH	(MY_RING_SMALL_SIZE * 2)
 #define MY_HIGH_ORDER		2
 #define MY_FRAG_SMALL_SIZE	256
+#define MY_XFER_RING_SIZE	512
+
 /* Makes tests selectable. Useful for perf-record to analyze a single test.
  * Hint: Bash shells support writing binary number like: $((2#101010))
  *
@@ -53,6 +55,7 @@ enum benchmark_bit {
 	bit_run_bench_dma,
 	bit_run_bench_bulk,
 	bit_run_bench_skb,
+	bit_run_bench_concurrent,
 };
 
 #define enabled(b)	(run_flags & BIT(b))
@@ -79,6 +82,14 @@ struct pp_bench_cfg {
 	unsigned int flags;
 	struct device *dev;
 	bool use_init_cb;
+};
+
+struct cross_cpu_ctx {
+	struct page_pool *pp;
+	struct ptr_ring xfer_ring;
+	int prod_cpu;
+	int cons_cpu;
+	bool stop;
 };
 
 static u32 scale_slow_loops(u32 nr_loops, u32 div)
@@ -835,6 +846,205 @@ static int time_bench_skb_recycle_linear(struct time_bench_record *rec,
 	return loops_cnt;
 }
 
+static int time_bench_percpu_worker(struct time_bench_record *rec, void *data)
+{
+	struct pp_bench_cfg cfg = {
+		.type = type_napi_local_cpuid,
+	};
+
+	return time_bench_page_pool_cfg(rec, &cfg, __func__);
+}
+
+static void run_concurrent_percpu_bench(u32 nr_loops)
+{
+	struct time_bench_cpu *cpu_tasks;
+	struct time_bench_sync sync;
+	cpumask_var_t mask;
+	unsigned int count = 0;
+	int cpu;
+
+	if (!zalloc_cpumask_var(&mask, GFP_KERNEL)) {
+		bench_failures++;
+		return;
+	}
+
+	cpus_read_lock();
+	for_each_online_cpu(cpu) {
+		cpumask_set_cpu(cpu, mask);
+		if (++count >= 4)
+			break;
+	}
+
+	cpu_tasks = kcalloc(nr_cpu_ids, sizeof(*cpu_tasks), GFP_KERNEL);
+	if (!cpu_tasks) {
+		cpus_read_unlock();
+		free_cpumask_var(mask);
+		bench_failures++;
+		return;
+	}
+
+	time_bench_run_concurrent(nr_loops, 0, NULL, mask, &sync, cpu_tasks,
+				  time_bench_percpu_worker);
+	time_bench_print_stats_cpumask("concurrent-percpu-fast", cpu_tasks,
+				       mask);
+
+	for_each_cpu(cpu, mask) {
+		if (!cpu_tasks[cpu].rec.invoked_cnt)
+			bench_failures++;
+	}
+
+	kfree(cpu_tasks);
+	cpus_read_unlock();
+	free_cpumask_var(mask);
+}
+
+static int cross_cpu_recycler_fn(void *arg)
+{
+	struct cross_cpu_ctx *ctx = arg;
+	void *batch[MY_BULK_SIZE];
+
+	while (!kthread_should_stop()) {
+		int n;
+
+		n = __ptr_ring_consume_batched(&ctx->xfer_ring, batch,
+					       MY_BULK_SIZE);
+		if (n > 0) {
+			int i;
+
+			local_bh_disable();
+			for (i = 0; i < n; i++) {
+				netmem_ref nm = (__force netmem_ref)batch[i];
+
+				page_pool_put_full_netmem(ctx->pp, nm, false);
+			}
+			local_bh_enable();
+			continue;
+		}
+
+		if (READ_ONCE(ctx->stop)) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			schedule_timeout(1);
+			continue;
+		}
+		cond_resched();
+	}
+
+	return 0;
+}
+
+static int time_bench_cross_cpu_ring(struct time_bench_record *rec, void *data)
+{
+	struct cross_cpu_ctx *ctx = data;
+	cpumask_var_t saved_mask;
+	struct task_struct *recycler;
+	u64 loops_cnt = 0;
+	void *leftover;
+	u32 i;
+
+	if (!alloc_cpumask_var(&saved_mask, GFP_KERNEL))
+		return 0;
+
+	cpumask_copy(saved_mask, current->cpus_ptr);
+	set_cpus_allowed_ptr(current, cpumask_of(ctx->prod_cpu));
+
+	recycler = kthread_create_on_cpu(cross_cpu_recycler_fn, ctx,
+					 ctx->cons_cpu, "pp_bench_rec%u");
+	if (IS_ERR(recycler)) {
+		set_cpus_allowed_ptr(current, saved_mask);
+		free_cpumask_var(saved_mask);
+		return 0;
+	}
+	wake_up_process(recycler);
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (i = 0; i < rec->loops; i++) {
+		netmem_ref netmem;
+
+		netmem = page_pool_alloc_netmems(ctx->pp, GFP_ATOMIC);
+		if (unlikely(!netmem))
+			break;
+
+		while (__ptr_ring_produce(&ctx->xfer_ring,
+					  (__force void *)netmem)) {
+			local_bh_enable();
+			cond_resched();
+			local_bh_disable();
+		}
+		loops_cnt++;
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	WRITE_ONCE(ctx->stop, true);
+	kthread_stop(recycler);
+
+	local_bh_disable();
+	while ((leftover = __ptr_ring_consume(&ctx->xfer_ring)))
+		page_pool_put_full_netmem(ctx->pp,
+					  (__force netmem_ref)leftover, false);
+	local_bh_enable();
+
+	set_cpus_allowed_ptr(current, saved_mask);
+	free_cpumask_var(saved_mask);
+
+	if (!pp_verify_stats(ctx->pp, __func__,
+			     PP_EXPECT_ALLOC_REFILL | PP_EXPECT_RECYCLE_RING))
+		loops_cnt = 0;
+
+	return loops_cnt;
+}
+
+static void run_cross_cpu_bench(u32 nr_loops)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = NUMA_NO_NODE,
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	struct cross_cpu_ctx ctx = {};
+	int prod_cpu, cons_cpu;
+
+	cpus_read_lock();
+	if (num_online_cpus() < 2) {
+		cpus_read_unlock();
+		pr_info("INFO: cross-cpu-ptr-ring requires >= 2 online CPUs\n");
+		return;
+	}
+
+	prod_cpu = cpumask_first(cpu_online_mask);
+	cons_cpu = cpumask_next(prod_cpu, cpu_online_mask);
+
+	if (ptr_ring_init(&ctx.xfer_ring, MY_XFER_RING_SIZE, GFP_KERNEL) < 0) {
+		cpus_read_unlock();
+		bench_failures++;
+		return;
+	}
+
+	ctx.pp = page_pool_create_percpu(&pp_params, prod_cpu);
+	if (IS_ERR(ctx.pp)) {
+		ptr_ring_cleanup(&ctx.xfer_ring, NULL);
+		cpus_read_unlock();
+		bench_failures++;
+		return;
+	}
+
+	ctx.prod_cpu = prod_cpu;
+	ctx.cons_cpu = cons_cpu;
+
+	if (!pp_fill_ptr_ring(ctx.pp, MY_XFER_RING_SIZE))
+		run_bench_case(scale_slow_loops(nr_loops, 4), 0,
+			       "cross-cpu-ptr-ring", &ctx,
+			       time_bench_cross_cpu_ring);
+	else
+		bench_failures++;
+
+	page_pool_destroy(ctx.pp);
+	ptr_ring_cleanup(&ctx.xfer_ring, NULL);
+	cpus_read_unlock();
+}
+
 static int run_benchmark_tests(void)
 {
 	u32 nr_loops = loops;
@@ -906,6 +1116,12 @@ static int run_benchmark_tests(void)
 	if (enabled(bit_run_bench_skb)) {
 		run_bench_case(nr_loops, 0, "bh-skb-recycle-linear", NULL,
 			       time_bench_skb_recycle_linear);
+	}
+
+	/* Multi-CPU per-CPU scaling & cross-CPU ptr_ring producer/consumer */
+	if (enabled(bit_run_bench_concurrent)) {
+		run_concurrent_percpu_bench(scale_slow_loops(nr_loops, 4));
+		run_cross_cpu_bench(nr_loops);
 	}
 
 	if (bench_failures) {
