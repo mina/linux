@@ -29,6 +29,7 @@
 static int verbose = 1;
 
 #define MY_POOL_SIZE		1024
+#define MY_BULK_SIZE		XDP_BULK_QUEUE_SIZE
 #define MY_OVERFLOW_BATCH	(PP_ALLOC_CACHE_SIZE + PP_ALLOC_CACHE_REFILL)
 #define MY_RING_SMALL_SIZE	64
 #define MY_RING_OVERFLOW_BATCH	(MY_RING_SMALL_SIZE * 2)
@@ -49,6 +50,9 @@ enum benchmark_bit {
 	bit_run_bench_bh_ring_slow,
 	bit_run_bench_high_order,
 	bit_run_bench_frag,
+	bit_run_bench_dma,
+	bit_run_bench_bulk,
+	bit_run_bench_skb,
 };
 
 #define enabled(b)	(run_flags & BIT(b))
@@ -58,6 +62,7 @@ static unsigned long loops = 1000000;
 module_param(loops, ulong, 0);
 MODULE_PARM_DESC(loops, "Specify loops bench will run");
 
+static struct platform_device *bench_dma_pdev;
 static int bench_failures;
 
 enum test_type {
@@ -72,6 +77,7 @@ struct pp_bench_cfg {
 	enum test_type type;
 	unsigned int order;
 	unsigned int flags;
+	struct device *dev;
 	bool use_init_cb;
 };
 
@@ -227,10 +233,13 @@ static int time_bench_page_pool_cfg(struct time_bench_record *rec,
 {
 	struct page_pool_params pp_params = {
 		.order = cfg->order,
+		.flags = cfg->flags,
 		.pool_size = MY_POOL_SIZE,
 		.nid = NUMA_NO_NODE,
+		.dev = cfg->dev,
 		.dma_dir = DMA_BIDIRECTIONAL,
 		.max_len = PAGE_SIZE << cfg->order,
+		.offset = (cfg->flags & PP_FLAG_DMA_SYNC_DEV) ? NET_SKB_PAD : 0,
 	};
 	struct napi_struct dummy_napi = {};
 	atomic_long_t init_cb_cnt;
@@ -278,6 +287,15 @@ static int time_bench_page_pool_cfg(struct time_bench_record *rec,
 			break;
 		loops_cnt++;
 		barrier();
+
+		if (cfg->flags & PP_FLAG_DMA_MAP) {
+			if (unlikely(!page_pool_get_dma_addr_netmem(netmem))) {
+				page_pool_put_full_netmem(pp, netmem, false);
+				loops_cnt = 0;
+				break;
+			}
+			page_pool_dma_sync_netmem_for_cpu(pp, netmem, 0, 64);
+		}
 
 		switch (cfg->type) {
 		case type_fast_path:
@@ -679,6 +697,144 @@ static int time_bench_frag_alloc_va(struct time_bench_record *rec, void *data)
 	return loops_cnt;
 }
 
+static int time_bench_dma_fast(struct time_bench_record *rec, void *data)
+{
+	struct pp_bench_cfg cfg = {
+		.type = type_fast_path,
+		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		.dev = &bench_dma_pdev->dev,
+	};
+
+	return time_bench_page_pool_cfg(rec, &cfg, __func__);
+}
+
+static int time_bench_dma_ptr_ring(struct time_bench_record *rec, void *data)
+{
+	struct pp_bench_cfg cfg = {
+		.type = type_ptr_ring,
+		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		.dev = &bench_dma_pdev->dev,
+	};
+
+	return time_bench_page_pool_cfg(rec, &cfg, __func__);
+}
+
+static int time_bench_dma_slow_map(struct time_bench_record *rec, void *data)
+{
+	struct pp_bench_cfg cfg = {
+		.type = type_page_allocator,
+		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		.dev = &bench_dma_pdev->dev,
+	};
+
+	return time_bench_page_pool_cfg(rec, &cfg, __func__);
+}
+
+static int time_bench_bulk_single_pool(struct time_bench_record *rec,
+				       void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = NUMA_NO_NODE,
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	netmem_ref bulk[MY_BULK_SIZE];
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 outer, j, batches;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp))
+		return 0;
+
+	if (pp_fill_ptr_ring(pp, PP_ALLOC_CACHE_REFILL)) {
+		page_pool_destroy(pp);
+		return 0;
+	}
+
+	batches = max_t(u32, rec->loops / MY_BULK_SIZE, 64U);
+	rec->loops = batches * MY_BULK_SIZE;
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (outer = 0; outer < batches; outer++) {
+		u32 got = 0;
+
+		for (j = 0; j < MY_BULK_SIZE; j++) {
+			bulk[j] = page_pool_alloc_netmems(pp, GFP_ATOMIC);
+			if (unlikely(!bulk[j]))
+				break;
+			got++;
+		}
+		if (got)
+			page_pool_put_netmem_bulk(bulk, got);
+		loops_cnt += got;
+		if (unlikely(got < MY_BULK_SIZE))
+			break;
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (!pp_verify_stats(pp, __func__,
+			     PP_EXPECT_ALLOC_REFILL | PP_EXPECT_RECYCLE_RING))
+		loops_cnt = 0;
+
+	page_pool_destroy(pp);
+	return loops_cnt;
+}
+
+static int time_bench_skb_recycle_linear(struct time_bench_record *rec,
+					 void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = NUMA_NO_NODE,
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 i;
+
+	pp = page_pool_create_percpu(&pp_params, raw_smp_processor_id());
+	if (IS_ERR(pp))
+		return 0;
+
+	local_bh_disable();
+	WRITE_ONCE(pp->cpuid, smp_processor_id());
+	time_bench_start(rec);
+	for (i = 0; i < rec->loops; i++) {
+		unsigned int truesize =
+			SKB_DATA_ALIGN(256) +
+			SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+		struct sk_buff *skb;
+		void *va;
+
+		va = page_pool_dev_alloc_va(pp, &truesize);
+		if (unlikely(!va))
+			break;
+		skb = napi_build_skb(va, truesize);
+		if (unlikely(!skb)) {
+			page_pool_free_va(pp, va, true);
+			break;
+		}
+		skb_mark_for_recycle(skb);
+		skb_put(skb, 64);
+		loops_cnt++;
+		napi_consume_skb(skb, 64);
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (!IS_ENABLED(CONFIG_PREEMPT_RT) &&
+	    !pp_verify_stats(pp, __func__, PP_EXPECT_RECYCLE_CACHED))
+		loops_cnt = 0;
+
+	page_pool_destroy(pp);
+	return loops_cnt;
+}
+
 static int run_benchmark_tests(void)
 {
 	u32 nr_loops = loops;
@@ -727,6 +883,31 @@ static int run_benchmark_tests(void)
 			       time_bench_frag_alloc_va);
 	}
 
+	/* DMA mapping, XArray tracking, and DMA sync */
+	if (enabled(bit_run_bench_dma)) {
+		run_bench_case(nr_loops, 0, "bh-dma-fast-sync", NULL,
+			       time_bench_dma_fast);
+		run_bench_case(nr_loops, 0, "bh-dma-ptr-ring-sync", NULL,
+			       time_bench_dma_ptr_ring);
+		run_bench_case(scale_slow_loops(nr_loops, 16), 0,
+			       "bh-dma-slow-map-unmap", NULL,
+			       time_bench_dma_slow_map);
+	}
+
+	/* Bulk return API */
+	if (enabled(bit_run_bench_bulk)) {
+		u32 bulk_loops = roundup(nr_loops, MY_BULK_SIZE);
+
+		run_bench_case(bulk_loops, MY_BULK_SIZE, "bh-bulk-single-pool",
+			       NULL, time_bench_bulk_single_pool);
+	}
+
+	/* SKB pp_recycle head_frag recycling */
+	if (enabled(bit_run_bench_skb)) {
+		run_bench_case(nr_loops, 0, "bh-skb-recycle-linear", NULL,
+			       time_bench_skb_recycle_linear);
+	}
+
 	if (bench_failures) {
 		pr_err("Completed with %d benchmark failure(s)\n",
 		       bench_failures);
@@ -739,6 +920,8 @@ static int run_benchmark_tests(void)
 
 static int __init bench_page_pool_simple_module_init(void)
 {
+	int err;
+
 	if (verbose)
 		pr_info("Loaded\n");
 
@@ -748,12 +931,32 @@ static int __init bench_page_pool_simple_module_init(void)
 		return -ECHRNG;
 	}
 
-	return run_benchmark_tests();
+	bench_dma_pdev = platform_device_register_simple("pp_bench_dma",
+							 PLATFORM_DEVID_NONE,
+							 NULL, 0);
+	if (IS_ERR(bench_dma_pdev))
+		return PTR_ERR(bench_dma_pdev);
+
+	err = dma_coerce_mask_and_coherent(&bench_dma_pdev->dev,
+					   DMA_BIT_MASK(64));
+	if (err) {
+		platform_device_unregister(bench_dma_pdev);
+		return err;
+	}
+
+	err = run_benchmark_tests();
+	if (err) {
+		platform_device_unregister(bench_dma_pdev);
+		return err;
+	}
+
+	return 0;
 }
 module_init(bench_page_pool_simple_module_init);
 
 static void __exit bench_page_pool_simple_module_exit(void)
 {
+	platform_device_unregister(bench_dma_pdev);
 	if (verbose)
 		pr_info("Unloaded\n");
 }
