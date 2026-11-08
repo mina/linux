@@ -123,18 +123,26 @@ static inline int __ptr_ring_check_produce(struct ptr_ring *r)
  */
 static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
 {
-	int ret = __ptr_ring_check_produce(r);
+	int producer = r->producer;
+	int size = r->size;
+	void **queue;
 
-	if (ret)
-		return ret;
+	if (unlikely(!size))
+		return -EINVAL;
+
+	queue = r->queue;
+	/* Paired with WRITE_ONCE() in __ptr_ring_zero_tail(). */
+	if (data_race(queue[producer]))
+		return -ENOSPC;
 
 	/* Make sure the pointer we are storing points to a valid data. */
 	/* Pairs with the dependency ordering in __ptr_ring_consume. */
 	smp_wmb();
 
-	WRITE_ONCE(r->queue[r->producer++], ptr);
-	if (unlikely(r->producer >= r->size))
-		r->producer = 0;
+	WRITE_ONCE(queue[producer++], ptr);
+	if (unlikely(producer >= size))
+		producer = 0;
+	r->producer = producer;
 	return 0;
 }
 
@@ -270,15 +278,17 @@ static inline bool ptr_ring_empty_bh(struct ptr_ring *r)
  */
 static inline void __ptr_ring_zero_tail(struct ptr_ring *r, int consumer_head)
 {
+	int tail = r->consumer_tail;
 	int head = consumer_head;
+	void **queue = r->queue;
 
 	/* Zero out entries in the reverse order: this way we touch the
 	 * cache line that producer might currently be reading the last;
 	 * producer won't make progress and touch other cache lines
 	 * besides the first one until we write out all entries.
 	 */
-	while (likely(head > r->consumer_tail))
-		data_race(r->queue[--head] = NULL);
+	while (likely(head > tail))
+		WRITE_ONCE(queue[--head], NULL);
 
 	r->consumer_tail = consumer_head;
 }
@@ -341,10 +351,14 @@ static inline int __ptr_ring_consume_batched(struct ptr_ring *r,
 	void *ptr;
 	int i;
 
+	if (unlikely(!r->size))
+		return 0;
+
 	for (i = 0; i < n; i++) {
-		ptr = __ptr_ring_consume(r);
+		ptr = READ_ONCE(r->queue[r->consumer_head]);
 		if (!ptr)
 			break;
+		__ptr_ring_discard_one(r);
 		array[i] = ptr;
 	}
 
