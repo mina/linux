@@ -447,16 +447,24 @@ static netmem_ref __page_pool_get_cached(struct page_pool *pool)
 	return netmem;
 }
 
-static void __page_pool_dma_sync_for_device(const struct page_pool *pool,
-					    netmem_ref netmem,
-					    u32 dma_sync_size)
+static noinline void
+__page_pool_dma_sync_for_device(const struct page_pool *pool,
+				netmem_ref netmem,
+				u32 dma_sync_size)
 {
 #if defined(CONFIG_HAS_DMA) && defined(CONFIG_DMA_NEED_SYNC)
-	dma_addr_t dma_addr = page_pool_get_dma_addr_netmem(netmem);
+	dma_addr_t dma_addr;
 
-	dma_sync_size = min(dma_sync_size, pool->p.max_len);
-	__dma_sync_single_for_device(pool->p.dev, dma_addr + pool->p.offset,
-				     dma_sync_size, pool->p.dma_dir);
+	rcu_read_lock();
+	/* re-check under rcu_read_lock() to sync with page_pool_scrub() */
+	if (likely(pool->dma_sync)) {
+		dma_addr = page_pool_get_dma_addr_netmem(netmem);
+		dma_sync_size = min(dma_sync_size, pool->p.max_len);
+		__dma_sync_single_for_device(pool->p.dev,
+					     dma_addr + pool->p.offset,
+					     dma_sync_size, pool->p.dma_dir);
+	}
+	rcu_read_unlock();
 #endif
 }
 
@@ -465,14 +473,8 @@ page_pool_dma_sync_for_device(const struct page_pool *pool,
 			      netmem_ref netmem,
 			      u32 dma_sync_size)
 {
-	if (pool->dma_sync && dma_dev_need_sync(pool->p.dev)) {
-		rcu_read_lock();
-		/* re-check under rcu_read_lock() to sync with page_pool_scrub() */
-		if (pool->dma_sync)
-			__page_pool_dma_sync_for_device(pool, netmem,
-							dma_sync_size);
-		rcu_read_unlock();
-	}
+	if (unlikely(pool->dma_sync && dma_dev_need_sync(pool->p.dev)))
+		__page_pool_dma_sync_for_device(pool, netmem, dma_sync_size);
 }
 
 static int page_pool_register_dma_index(struct page_pool *pool,
@@ -836,7 +838,7 @@ static bool __page_pool_page_can_be_recycled(netmem_ref netmem)
  * If the page refcnt != 1, then the page will be returned to memory
  * subsystem.
  */
-static __always_inline netmem_ref
+static __always_inline bool
 __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 		     unsigned int dma_sync_size, bool allow_direct)
 {
@@ -857,10 +859,10 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 		page_pool_dma_sync_for_device(pool, netmem, dma_sync_size);
 
 		if (allow_direct && page_pool_recycle_in_cache(netmem, pool))
-			return 0;
+			return false;
 
 		/* Page found as candidate for recycling */
-		return netmem;
+		return true;
 	}
 
 	/* Fallback/non-XDP mode: API user have elevated refcnt.
@@ -879,7 +881,7 @@ __page_pool_put_page(struct page_pool *pool, netmem_ref netmem,
 	recycle_stat_inc(pool, released_refcnt);
 	page_pool_return_netmem(pool, netmem);
 
-	return 0;
+	return false;
 }
 
 static bool page_pool_napi_local(const struct page_pool *pool)
@@ -912,12 +914,14 @@ static bool page_pool_napi_local(const struct page_pool *pool)
 void page_pool_put_unrefed_netmem(struct page_pool *pool, netmem_ref netmem,
 				  unsigned int dma_sync_size, bool allow_direct)
 {
-	if (!allow_direct)
-		allow_direct = page_pool_napi_local(pool);
+	if (!__page_pool_put_page(pool, netmem, dma_sync_size, false))
+		return;
 
-	netmem = __page_pool_put_page(pool, netmem, dma_sync_size,
-				      allow_direct);
-	if (netmem && !page_pool_recycle_in_ring(pool, netmem)) {
+	if ((allow_direct || page_pool_napi_local(pool)) &&
+	    page_pool_recycle_in_cache(netmem, pool))
+		return;
+
+	if (!page_pool_recycle_in_ring(pool, netmem)) {
 		/* Cache full, fallback to free pages */
 		recycle_stat_inc(pool, ring_full);
 		page_pool_return_netmem(pool, netmem);
@@ -1017,10 +1021,9 @@ void page_pool_put_netmem_bulk(netmem_ref *data, u32 count)
 				continue;
 			}
 
-			netmem = __page_pool_put_page(pool, netmem, -1,
-						      allow_direct);
 			/* Approved for bulk recycling in ptr_ring cache */
-			if (netmem)
+			if (__page_pool_put_page(pool, netmem, -1,
+						 allow_direct))
 				bulk[bulk_len++] = netmem;
 		}
 
