@@ -272,12 +272,9 @@ static inline struct netmem_desc *__netmem_to_nmdesc(netmem_ref netmem)
  */
 static inline struct netmem_desc *netmem_to_nmdesc(netmem_ref netmem)
 {
-	void *p = (void *)((__force unsigned long)netmem & ~NET_IOV);
+	static_assert(offsetof(struct net_iov, desc) == 0);
 
-	if (netmem_is_net_iov(netmem))
-		return &((struct net_iov *)p)->desc;
-
-	return __pp_page_to_nmdesc((struct page *)p);
+	return (struct netmem_desc *)((__force unsigned long)netmem & ~NET_IOV);
 }
 
 /**
@@ -311,10 +308,10 @@ static inline bool netmem_is_pref_nid(netmem_ref netmem, int pref_nid)
 	/* NUMA node preference only applies to struct page; net_iovs are
 	 * managed by their memory provider.
 	 */
-	if (netmem_is_net_iov(netmem))
+	if (unlikely(netmem_is_net_iov(netmem)))
 		return true;
 
-	return page_to_nid(netmem_to_page(netmem)) == pref_nid;
+	return page_to_nid(__netmem_to_page(netmem)) == pref_nid;
 }
 
 static inline netmem_ref netmem_compound_head(netmem_ref netmem)

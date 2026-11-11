@@ -633,7 +633,7 @@ static noinline netmem_ref __page_pool_alloc_netmems_slow(struct page_pool *pool
 	for (i = 0; i < nr_pages; i++) {
 		netmem = pool->alloc.cache[i];
 		if (dma_map && unlikely(!page_pool_dma_map(pool, netmem, gfp))) {
-			put_page(netmem_to_page(netmem));
+			put_page(__netmem_to_page(netmem));
 			continue;
 		}
 
@@ -775,7 +775,7 @@ static void page_pool_return_netmem(struct page_pool *pool, netmem_ref netmem)
 
 	if (put) {
 		page_pool_clear_pp_info(netmem);
-		put_page(netmem_to_page(netmem));
+		put_page(__netmem_to_page(netmem));
 	}
 	/* An optimization would be to call __free_pages(page, pool->p.order)
 	 * knowing page is not part of page-cache (thus avoiding a
@@ -818,9 +818,13 @@ static bool page_pool_recycle_in_cache(netmem_ref netmem,
 
 static bool __page_pool_page_can_be_recycled(netmem_ref netmem)
 {
-	return netmem_is_net_iov(netmem) ||
-	       (page_ref_count(netmem_to_page(netmem)) == 1 &&
-		!page_is_pfmemalloc(netmem_to_page(netmem)));
+	struct page *page;
+
+	if (unlikely(netmem_is_net_iov(netmem)))
+		return true;
+
+	page = __netmem_to_page(netmem);
+	return likely(page_ref_count(page) == 1 && !page_is_pfmemalloc(page));
 }
 
 /* If the page refcnt == 1, this will try to recycle the page.
