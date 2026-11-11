@@ -381,6 +381,7 @@ static void page_pool_return_netmem(struct page_pool *pool, netmem_ref netmem);
 static noinline netmem_ref page_pool_refill_alloc_cache(struct page_pool *pool)
 {
 	struct ptr_ring *r = &pool->ring;
+	u32 count = pool->alloc.count;
 	netmem_ref netmem;
 	int pref_nid; /* preferred NUMA node */
 
@@ -407,7 +408,7 @@ static noinline netmem_ref page_pool_refill_alloc_cache(struct page_pool *pool)
 			break;
 
 		if (likely(netmem_is_pref_nid(netmem, pref_nid))) {
-			pool->alloc.cache[pool->alloc.count++] = netmem;
+			pool->alloc.cache[count++] = netmem;
 		} else {
 			/* NUMA mismatch;
 			 * (1) release 1 page to page-allocator and
@@ -419,30 +420,14 @@ static noinline netmem_ref page_pool_refill_alloc_cache(struct page_pool *pool)
 			netmem = 0;
 			break;
 		}
-	} while (pool->alloc.count < PP_ALLOC_CACHE_REFILL);
+	} while (count < PP_ALLOC_CACHE_REFILL);
 
 	/* Return last page */
-	if (likely(pool->alloc.count > 0)) {
-		netmem = pool->alloc.cache[--pool->alloc.count];
+	if (likely(count > 0)) {
+		netmem = pool->alloc.cache[--count];
 		alloc_stat_inc(pool, refill);
 	}
-
-	return netmem;
-}
-
-/* fast path */
-static netmem_ref __page_pool_get_cached(struct page_pool *pool)
-{
-	netmem_ref netmem;
-
-	/* Caller MUST guarantee safe non-concurrent access, e.g. softirq */
-	if (likely(pool->alloc.count)) {
-		/* Fast-path */
-		netmem = pool->alloc.cache[--pool->alloc.count];
-		alloc_stat_inc(pool, fast);
-	} else {
-		netmem = page_pool_refill_alloc_cache(pool);
-	}
+	pool->alloc.count = count;
 
 	return netmem;
 }
@@ -618,6 +603,7 @@ static noinline netmem_ref __page_pool_alloc_netmems_slow(struct page_pool *pool
 	bool dma_map = pool->dma_map;
 	netmem_ref netmem;
 	int i, nr_pages;
+	u32 count = 0;
 
 	/* Unconditionally set NOWARN if allocating from NAPI.
 	 * Drivers forget to set it, and OOM reports on packet Rx are useless.
@@ -652,7 +638,7 @@ static noinline netmem_ref __page_pool_alloc_netmems_slow(struct page_pool *pool
 		}
 
 		page_pool_set_pp_info(pool, netmem);
-		pool->alloc.cache[pool->alloc.count++] = netmem;
+		pool->alloc.cache[count++] = netmem;
 		/* Track how many pages are held 'in-flight' */
 		pool->pages_state_hold_cnt++;
 		trace_page_pool_state_hold(pool, netmem,
@@ -660,44 +646,49 @@ static noinline netmem_ref __page_pool_alloc_netmems_slow(struct page_pool *pool
 	}
 
 	/* Return last page */
-	if (likely(pool->alloc.count > 0)) {
-		netmem = pool->alloc.cache[--pool->alloc.count];
+	if (likely(count > 0)) {
+		netmem = pool->alloc.cache[--count];
 		alloc_stat_inc(pool, slow);
 	} else {
 		netmem = 0;
 	}
+	pool->alloc.count = count;
 
 	/* When page just alloc'ed is should/must have refcnt 1. */
 	return netmem;
 }
 
-/* For using page_pool replace: alloc_pages() API calls, but provide
- * synchronization guarantee for allocation side.
- */
-netmem_ref page_pool_alloc_netmems(struct page_pool *pool, gfp_t gfp)
+static noinline netmem_ref
+page_pool_alloc_netmems_refill(struct page_pool *pool, gfp_t gfp)
 {
 	netmem_ref netmem;
 
-	/* Fast-path: Get a page from cache */
-	netmem = __page_pool_get_cached(pool);
-	if (netmem)
+	netmem = page_pool_refill_alloc_cache(pool);
+	if (likely(netmem))
 		return netmem;
 
 	/* Slow-path: cache empty, do real allocation */
 	if (static_branch_unlikely(&page_pool_mem_providers) && pool->mp_ops)
-		netmem = pool->mp_ops->alloc_netmems(pool, gfp);
-	else
-		netmem = __page_pool_alloc_netmems_slow(pool, gfp);
-	return netmem;
+		return pool->mp_ops->alloc_netmems(pool, gfp);
+
+	return __page_pool_alloc_netmems_slow(pool, gfp);
+}
+
+/* For using page_pool replace: alloc_pages() API calls, but provide
+ * synchronization guarantee for allocation side.
+ */
+noinline netmem_ref page_pool_alloc_netmems(struct page_pool *pool, gfp_t gfp)
+{
+	/* Caller MUST guarantee safe non-concurrent access, e.g. softirq */
+	if (likely(pool->alloc.count)) {
+		alloc_stat_inc(pool, fast);
+		return pool->alloc.cache[--pool->alloc.count];
+	}
+
+	return page_pool_alloc_netmems_refill(pool, gfp);
 }
 EXPORT_SYMBOL(page_pool_alloc_netmems);
 ALLOW_ERROR_INJECTION(page_pool_alloc_netmems, NULL);
-
-struct page *page_pool_alloc_pages(struct page_pool *pool, gfp_t gfp)
-{
-	return netmem_to_page(page_pool_alloc_netmems(pool, gfp));
-}
-EXPORT_SYMBOL(page_pool_alloc_pages);
 
 /* Calculate distance between two u32 values, valid if distance is below 2^(31)
  *  https://en.wikipedia.org/wiki/Serial_number_arithmetic#General_Solution
