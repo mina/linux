@@ -123,6 +123,9 @@ static inline int __ptr_ring_check_produce(struct ptr_ring *r)
  */
 static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
 {
+	int producer = r->producer;
+	int size = r->size;
+	void **queue = r->queue;
 	int ret = __ptr_ring_check_produce(r);
 
 	if (ret)
@@ -132,9 +135,10 @@ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
 	/* Pairs with the dependency ordering in __ptr_ring_consume. */
 	smp_wmb();
 
-	WRITE_ONCE(r->queue[r->producer++], ptr);
-	if (unlikely(r->producer >= r->size))
-		r->producer = 0;
+	WRITE_ONCE(queue[producer++], ptr);
+	if (unlikely(producer >= size))
+		producer = 0;
+	r->producer = producer;
 	return 0;
 }
 
@@ -270,15 +274,17 @@ static inline bool ptr_ring_empty_bh(struct ptr_ring *r)
  */
 static inline void __ptr_ring_zero_tail(struct ptr_ring *r, int consumer_head)
 {
+	int tail = r->consumer_tail;
 	int head = consumer_head;
+	void **queue = r->queue;
 
 	/* Zero out entries in the reverse order: this way we touch the
 	 * cache line that producer might currently be reading the last;
 	 * producer won't make progress and touch other cache lines
 	 * besides the first one until we write out all entries.
 	 */
-	while (likely(head > r->consumer_tail))
-		data_race(r->queue[--head] = NULL);
+	while (likely(head > tail))
+		WRITE_ONCE(queue[--head], NULL);
 
 	r->consumer_tail = consumer_head;
 }
