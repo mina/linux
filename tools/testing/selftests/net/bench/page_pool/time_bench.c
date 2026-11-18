@@ -235,12 +235,17 @@ bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		return false;
 	}
 
-	if (rec.invoked_cnt < loops)
-		pr_warn("WARNING: Invoke count(%llu) smaller than loops(%d)\n",
-			rec.invoked_cnt, loops);
+	if (rec.invoked_cnt < rec.loops) {
+		pr_err("ABORT: Invoke count(%llu) smaller than loops(%u)\n",
+		       rec.invoked_cnt, rec.loops);
+		return false;
+	}
 
 	/* Calculate stats */
-	time_bench_calc_stats(&rec);
+	if (!time_bench_calc_stats(&rec)) {
+		pr_err("ABORT: Failed to calculate stats for %s\n", txt);
+		return false;
+	}
 
 	if (rec.flags & TIME_BENCH_TSC) {
 		pr_info("Type:%s Per elem: %llu cycles(tsc) %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu tsc_interval:%llu)\n",
