@@ -196,8 +196,8 @@ static inline uint64_t msr_inst(unsigned long long *msr_result)
 
 /** Generic functions **
  */
-bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
-		     int (*func)(struct time_bench_record *rec, void *data));
+int time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
+		    int (*func)(struct time_bench_record *rec, void *data));
 bool time_bench_calc_stats(struct time_bench_record *rec);
 
 void time_bench_run_concurrent(uint32_t loops, int step, void *data,

@@ -215,10 +215,12 @@ bool time_bench_calc_stats(struct time_bench_record *rec)
  * execution time stats.  The function being called/timed is assumed
  * to perform a tight loop, and update the timing record struct.
  */
-bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
-		     int (*func)(struct time_bench_record *record, void *data))
+/* Returns 0 on pass, > 0 if skipped (func < 0), and < 0 on failure. */
+int time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
+		    int (*func)(struct time_bench_record *record, void *data))
 {
 	struct time_bench_record rec;
+	int ret;
 
 	/* Setup record */
 	memset(&rec, 0, sizeof(rec)); /* zero func might not update all */
@@ -230,21 +232,24 @@ bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		rec.flags |= TIME_BENCH_TSC;
 
 	/*** Loop function being timed ***/
-	if (!func(&rec, data)) {
+	ret = func(&rec, data);
+	if (ret < 0)
+		return 1;
+	if (!ret) {
 		pr_err("ABORT: function being timed failed\n");
-		return false;
+		return -EINVAL;
 	}
 
 	if (rec.invoked_cnt < rec.loops) {
 		pr_err("ABORT: Invoke count(%llu) smaller than loops(%u)\n",
 		       rec.invoked_cnt, rec.loops);
-		return false;
+		return -EINVAL;
 	}
 
 	/* Calculate stats */
 	if (!time_bench_calc_stats(&rec)) {
 		pr_err("ABORT: Failed to calculate stats for %s\n", txt);
-		return false;
+		return -EINVAL;
 	}
 
 	if (rec.flags & TIME_BENCH_TSC) {
@@ -264,7 +269,7 @@ bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		pr_info("Type:%s PMU inst/clock%llu/%llu = %llu.%03llu IPC (inst per cycle)\n",
 			txt, rec.pmc_inst, rec.pmc_clk, rec.pmc_ipc_quotient,
 			rec.pmc_ipc_decimal);
-	return true;
+	return 0;
 }
 
 /* Function getting invoked by kthread */

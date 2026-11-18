@@ -22,6 +22,10 @@
 static int verbose = 1;
 
 #define MY_POOL_SIZE		1024
+#define MY_OVERFLOW_BATCH	(PP_ALLOC_CACHE_SIZE + PP_ALLOC_CACHE_REFILL)
+#define MY_RING_SMALL_SIZE	64
+#define MY_RING_OVERFLOW_BATCH	(MY_RING_SMALL_SIZE * 2)
+#define MY_HIGH_ORDER		2
 #define MY_LOOPS_MIN		1000UL
 #define MY_LOOPS_MAX		10000000UL
 
@@ -38,6 +42,7 @@ MODULE_PARM_DESC(run_flags, "Bitmask limiting which benchmark groups run");
 enum benchmark_bit {
 	bit_run_bench_bh_fast,
 	bit_run_bench_bh_ring_slow,
+	bit_run_bench_high_order,
 };
 
 #define enabled(b)	(run_flags & BIT(b))
@@ -47,6 +52,7 @@ module_param(loops, ulong, 0);
 MODULE_PARM_DESC(loops, "Specify loops bench will run");
 
 static int bench_failures;
+static int bench_skips;
 
 enum test_type {
 	type_fast_path,
@@ -59,7 +65,17 @@ enum test_type {
 struct pp_bench_cfg {
 	const char *name;
 	enum test_type type;
+	unsigned int order;
 	bool use_init_cb;
+};
+
+struct pp_overflow_cfg {
+	const char *name;
+	unsigned int pool_size;
+	unsigned int batch_size;
+	unsigned int min_batches;
+	u32 expect_mask;
+	bool recycle_direct;
 };
 
 static u32 scale_slow_loops(u32 nr_loops, u32 div)
@@ -71,9 +87,13 @@ static void run_bench_case(u32 nr_loops, int step, const char *name, void *data,
 			   int (*func)(struct time_bench_record *rec,
 				       void *data))
 {
-	if (!time_bench_loop(nr_loops, step, name, data, func)) {
+	int ret = time_bench_loop(nr_loops, step, name, data, func);
+
+	if (ret < 0) {
 		pr_err("FAIL: benchmark %s failed\n", name);
 		bench_failures++;
+	} else if (ret > 0) {
+		bench_skips++;
 	}
 	cond_resched();
 }
@@ -257,7 +277,7 @@ static void pp_init_cb(netmem_ref netmem, void *arg)
 	atomic_long_inc(cnt);
 }
 
-static int pp_fill_ptr_ring(struct page_pool *pp, int elems)
+static int pp_fill_ptr_ring(struct page_pool *pp, int elems, gfp_t gfp)
 {
 	netmem_ref *array;
 	int i, allocated = 0;
@@ -267,7 +287,7 @@ static int pp_fill_ptr_ring(struct page_pool *pp, int elems)
 		return -ENOMEM;
 
 	for (i = 0; i < elems; i++) {
-		array[i] = page_pool_alloc_netmems(pp, GFP_KERNEL);
+		array[i] = page_pool_alloc_netmems(pp, gfp);
 		if (!array[i])
 			break;
 		allocated++;
@@ -285,21 +305,26 @@ static int time_bench_page_pool_cfg(struct time_bench_record *rec, void *data)
 {
 	const struct pp_bench_cfg *cfg = data;
 	struct page_pool_params pp_params = {
-		.order = 0,
+		.order = cfg->order,
 		.pool_size = MY_POOL_SIZE,
 		.nid = numa_mem_id(),
 		.dma_dir = DMA_BIDIRECTIONAL,
-		.max_len = PAGE_SIZE,
+		.max_len = PAGE_SIZE << cfg->order,
 	};
+	gfp_t fill_gfp = cfg->order ? (GFP_KERNEL | __GFP_NORETRY |
+				       __GFP_NOWARN | __GFP_THISNODE) :
+			 GFP_KERNEL;
 	struct napi_struct dummy_napi = {
 		.list_owner = -1,
 	};
 	struct pp_stats_snap before;
 	atomic_long_t init_cb_cnt;
 	u32 expect_mask = 0, forbid_mask = 0;
+	bool alloc_failed = false;
 	struct page_pool *pp;
 	u64 loops_cnt = 0;
 	netmem_ref netmem;
+	int fill_err;
 	u32 i;
 
 	atomic_long_set(&init_cb_cnt, 0);
@@ -322,7 +347,12 @@ static int time_bench_page_pool_cfg(struct time_bench_record *rec, void *data)
 	if (cfg->type == type_napi_local_ptr)
 		page_pool_enable_direct_recycling(pp, &dummy_napi);
 
-	if (pp_fill_ptr_ring(pp, PP_ALLOC_CACHE_REFILL)) {
+	fill_err = pp_fill_ptr_ring(pp, PP_ALLOC_CACHE_REFILL, fill_gfp);
+	if (fill_err) {
+		if (cfg->order && fill_err == -EAGAIN)
+			goto out_skip;
+		pr_err("ERR: %s: failed to prefill ptr_ring (%d)\n",
+		       cfg->name, fill_err);
 		loops_cnt = 0;
 		goto out_disable;
 	}
@@ -350,8 +380,10 @@ static int time_bench_page_pool_cfg(struct time_bench_record *rec, void *data)
 		}
 
 		netmem = page_pool_alloc_netmems(pp, GFP_ATOMIC);
-		if (unlikely(!netmem))
+		if (unlikely(!netmem)) {
+			alloc_failed = true;
 			break;
+		}
 		loops_cnt++;
 		barrier();
 
@@ -378,6 +410,8 @@ static int time_bench_page_pool_cfg(struct time_bench_record *rec, void *data)
 	local_bh_enable();
 
 	if (loops_cnt < rec->loops) {
+		if (cfg->order && alloc_failed)
+			goto out_skip;
 		loops_cnt = 0;
 		goto out_disable;
 	}
@@ -439,6 +473,14 @@ out_disable:
 	if (!loops_cnt)
 		rec->invoked_cnt = 0;
 	return loops_cnt;
+
+out_skip:
+	pr_info("SKIP: %s: order-%u pages unavailable\n",
+		cfg->name, cfg->order);
+	if (cfg->type == type_napi_local_ptr)
+		page_pool_disable_direct_recycling(pp);
+	page_pool_destroy(pp);
+	return -EAGAIN;
 }
 
 static const struct pp_bench_cfg cfg_bh_fast_direct = {
@@ -467,6 +509,107 @@ static const struct pp_bench_cfg cfg_bh_slow_alloc = {
 	.use_init_cb = true,
 };
 
+static int time_bench_bh_overflow(struct time_bench_record *rec, void *data)
+{
+	const struct pp_overflow_cfg *cfg = data;
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = cfg->pool_size,
+		.nid = numa_mem_id(),
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	struct pp_stats_snap before;
+	netmem_ref *batch;
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 outer, j, batches;
+
+	batch = kcalloc(cfg->batch_size, sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return 0;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp)) {
+		kfree(batch);
+		return 0;
+	}
+
+	batches = max_t(u32, rec->loops / cfg->batch_size, cfg->min_batches);
+	rec->loops = batches * cfg->batch_size;
+	pp_snapshot_stats(pp, &before);
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (outer = 0; outer < batches; outer++) {
+		u32 got = 0;
+
+		if (unlikely((outer & 0xff) == 0 && outer))
+			pp_bh_yield();
+
+		for (j = 0; j < cfg->batch_size; j++) {
+			batch[j] = page_pool_alloc_netmems(pp, GFP_ATOMIC);
+			if (unlikely(!batch[j]))
+				break;
+			got++;
+		}
+		for (j = 0; j < got; j++) {
+			if (cfg->recycle_direct)
+				page_pool_recycle_direct_netmem(pp, batch[j]);
+			else
+				page_pool_put_full_netmem(pp, batch[j], false);
+		}
+
+		loops_cnt += got;
+		if (unlikely(got < cfg->batch_size))
+			break;
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (loops_cnt < rec->loops ||
+	    !pp_verify_stats(pp, cfg->name, &before, cfg->expect_mask, 0)) {
+		loops_cnt = 0;
+		rec->invoked_cnt = 0;
+	}
+
+	page_pool_destroy(pp);
+	kfree(batch);
+	return loops_cnt;
+}
+
+static const struct pp_overflow_cfg cfg_bh_cache_overflow = {
+	.name = "bh-cache-overflow-refill",
+	.pool_size = MY_POOL_SIZE,
+	.batch_size = MY_OVERFLOW_BATCH,
+	.min_batches = 8,
+	.recycle_direct = true,
+	.expect_mask = PP_EXPECT_ALLOC_FAST | PP_EXPECT_ALLOC_REFILL |
+		       PP_EXPECT_RECYCLE_CACHED | PP_EXPECT_RECYCLE_CACHE_FULL |
+		       PP_EXPECT_RECYCLE_RING,
+};
+
+static const struct pp_overflow_cfg cfg_bh_ring_full = {
+	.name = "bh-ring-full-return",
+	.pool_size = MY_RING_SMALL_SIZE,
+	.batch_size = MY_RING_OVERFLOW_BATCH,
+	.min_batches = 16,
+	.recycle_direct = false,
+	.expect_mask = PP_EXPECT_ALLOC_EMPTY | PP_EXPECT_ALLOC_SLOW |
+		       PP_EXPECT_RECYCLE_RING | PP_EXPECT_RECYCLE_RING_FULL,
+};
+
+static const struct pp_bench_cfg cfg_high_order_fast = {
+	.name = "bh-high-order-fast",
+	.type = type_fast_path,
+	.order = MY_HIGH_ORDER,
+};
+
+static const struct pp_bench_cfg cfg_high_order_ring = {
+	.name = "bh-high-order-ptr-ring",
+	.type = type_ptr_ring,
+	.order = MY_HIGH_ORDER,
+};
+
 static int run_benchmark_tests(void)
 {
 	u32 nr_loops = loops;
@@ -484,24 +627,43 @@ static int run_benchmark_tests(void)
 			       time_bench_page_pool_cfg);
 	}
 
-	/* BH ptr_ring and slow page allocator */
+	/* BH ptr_ring, cache_full refill, ring_full overflow, and slow alloc */
 	if (enabled(bit_run_bench_bh_ring_slow)) {
 		run_bench_case(nr_loops, 0, cfg_bh_ptr_ring.name,
 			       (void *)&cfg_bh_ptr_ring,
 			       time_bench_page_pool_cfg);
+		run_bench_case(roundup(nr_loops, MY_OVERFLOW_BATCH),
+			       MY_OVERFLOW_BATCH, cfg_bh_cache_overflow.name,
+			       (void *)&cfg_bh_cache_overflow,
+			       time_bench_bh_overflow);
+		run_bench_case(roundup(scale_slow_loops(nr_loops, 16),
+				       MY_RING_OVERFLOW_BATCH),
+			       MY_RING_OVERFLOW_BATCH, cfg_bh_ring_full.name,
+			       (void *)&cfg_bh_ring_full,
+			       time_bench_bh_overflow);
 		run_bench_case(scale_slow_loops(nr_loops, 16), 0,
 			       cfg_bh_slow_alloc.name,
 			       (void *)&cfg_bh_slow_alloc,
 			       time_bench_page_pool_cfg);
 	}
 
+	/* High-order compound pages (order=2) */
+	if (enabled(bit_run_bench_high_order)) {
+		run_bench_case(nr_loops, 0, cfg_high_order_fast.name,
+			       (void *)&cfg_high_order_fast,
+			       time_bench_page_pool_cfg);
+		run_bench_case(nr_loops, 0, cfg_high_order_ring.name,
+			       (void *)&cfg_high_order_ring,
+			       time_bench_page_pool_cfg);
+	}
+
 	if (bench_failures) {
-		pr_err("Completed with %d benchmark failure(s)\n",
-		       bench_failures);
+		pr_err("Completed with %d benchmark failure(s) (%d skipped)\n",
+		       bench_failures, bench_skips);
 		return -EINVAL;
 	}
 
-	pr_info("All page_pool benchmarks passed\n");
+	pr_info("All page_pool benchmarks passed (%d skipped)\n", bench_skips);
 	return 0;
 }
 
