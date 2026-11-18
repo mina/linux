@@ -8,6 +8,8 @@
 #ifndef _LINUX_TIME_BENCH_H
 #define _LINUX_TIME_BENCH_H
 
+#include <linux/timex.h>
+
 /* Main structure used for recording a benchmark run */
 struct time_bench_record {
 	uint32_t version_abi;
@@ -75,57 +77,44 @@ struct time_bench_cpu {
 };
 
 /*
- * Below TSC assembler code is not compatible with other archs, and
- * can also fail on guests if cpu-flags are not correct.
- *
- * The way TSC reading is used, many iterations, does not require as
- * high accuracy as described below (in Intel Doc #324264).
- *
- * Considering changing to use get_cycles() (#include <asm/timex.h>).
+ * Use rdtsc_ordered() on x86 when TSC is available so guests without RDTSCP
+ * do not fault with #UD; non-TSC architectures rely on wall-clock timing.
  */
+#if defined(CONFIG_X86) && !defined(CONFIG_UML)
+static __always_inline bool time_bench_has_tsc(void)
+{
+	return cpu_feature_enabled(X86_FEATURE_TSC);
+}
 
-/** TSC (Time-Stamp Counter) based **
- * Recommend reading, to understand details of reading TSC accurately:
- *  Intel Doc #324264, "How to Benchmark Code Execution Times on Intel"
- *
- * Consider getting exclusive ownership of CPU by using:
- *   unsigned long flags;
- *   preempt_disable();
- *   raw_local_irq_save(flags);
- *   _your_code_
- *   raw_local_irq_restore(flags);
- *   preempt_enable();
- *
- * Clobbered registers: "%rax", "%rbx", "%rcx", "%rdx"
- *  RDTSC only change "%rax" and "%rdx" but
- *  CPUID clears the high 32-bits of all (rax/rbx/rcx/rdx)
- */
 static __always_inline uint64_t tsc_start_clock(void)
 {
-	/* See: Intel Doc #324264 */
-	unsigned int hi, lo;
-
-	asm volatile("CPUID\n\t"
-		     "RDTSC\n\t"
-		     "mov %%edx, %0\n\t"
-		     "mov %%eax, %1\n\t"
-		     : "=r"(hi), "=r"(lo)::"%rax", "%rbx", "%rcx", "%rdx");
-	//FIXME: on 32bit use clobbered %eax + %edx
-	return ((uint64_t)lo) | (((uint64_t)hi) << 32);
+	if (!time_bench_has_tsc())
+		return 0;
+	return rdtsc_ordered();
 }
 
 static __always_inline uint64_t tsc_stop_clock(void)
 {
-	/* See: Intel Doc #324264 */
-	unsigned int hi, lo;
-
-	asm volatile("RDTSCP\n\t"
-		     "mov %%edx, %0\n\t"
-		     "mov %%eax, %1\n\t"
-		     "CPUID\n\t"
-		     : "=r"(hi), "=r"(lo)::"%rax", "%rbx", "%rcx", "%rdx");
-	return ((uint64_t)lo) | (((uint64_t)hi) << 32);
+	if (!time_bench_has_tsc())
+		return 0;
+	return rdtsc_ordered();
 }
+#else
+static __always_inline bool time_bench_has_tsc(void)
+{
+	return false;
+}
+
+static __always_inline uint64_t tsc_start_clock(void)
+{
+	return 0;
+}
+
+static __always_inline uint64_t tsc_stop_clock(void)
+{
+	return 0;
+}
+#endif
 
 /** Wall-clock based **
  *
@@ -161,13 +150,20 @@ enum {
 	FIXED_CPU_CLK_UNHALTED_REF = 2,
 };
 
-static __always_inline unsigned int long long p_rdpmc(unsigned int in)
+#if defined(CONFIG_X86) && !defined(CONFIG_UML)
+static __always_inline unsigned long long p_rdpmc(unsigned int in)
 {
 	unsigned int d, a;
 
 	asm volatile("rdpmc" : "=d"(d), "=a"(a) : "c"(in) : "memory");
 	return ((unsigned long long)d << 32) | a;
 }
+#else
+static __always_inline unsigned long long p_rdpmc(unsigned int in)
+{
+	return 0;
+}
+#endif
 
 /* These PMU counter needs to be enabled, but I don't have the
  * configure code implemented.  My current hack is running:
@@ -185,6 +181,7 @@ static __always_inline unsigned long long pmc_clk(void)
 	return p_rdpmc(FIXED_SELECT | FIXED_CPU_CLK_UNHALTED_CORE);
 }
 
+#if defined(CONFIG_X86_64) && !defined(CONFIG_UML)
 /* Raw reading via MSR rdmsr() is likely wrong
  * FIXME: How can I know which raw MSR registers are conf for what?
  */
@@ -195,10 +192,11 @@ static inline uint64_t msr_inst(unsigned long long *msr_result)
 {
 	return rdmsrq_safe(MSR_IA32_PCM0, msr_result);
 }
+#endif
 
 /** Generic functions **
  */
-bool time_bench_loop(uint32_t loops, int step, char *txt, void *data,
+bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		     int (*func)(struct time_bench_record *rec, void *data));
 bool time_bench_calc_stats(struct time_bench_record *rec);
 
@@ -219,13 +217,15 @@ static __always_inline void time_bench_start(struct time_bench_record *rec)
 		rec->pmc_inst_start = pmc_inst();
 		rec->pmc_clk_start = pmc_clk();
 	}
-	rec->tsc_start = tsc_start_clock();
+	if (rec->flags & TIME_BENCH_TSC)
+		rec->tsc_start = tsc_start_clock();
 }
 
 static __always_inline void time_bench_stop(struct time_bench_record *rec,
 					    uint64_t invoked_cnt)
 {
-	rec->tsc_stop = tsc_stop_clock();
+	if (rec->flags & TIME_BENCH_TSC)
+		rec->tsc_stop = tsc_stop_clock();
 	if (rec->flags & TIME_BENCH_PMU) {
 		rec->pmc_inst_stop = pmc_inst();
 		rec->pmc_clk_stop = pmc_clk();

@@ -6,6 +6,7 @@
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/time.h>
 
@@ -143,7 +144,8 @@ bool time_bench_calc_stats(struct time_bench_record *rec)
 		}
 		/* Calculate stats */
 		if (rec->flags & TIME_BENCH_LOOP)
-			rec->tsc_cycles = rec->tsc_interval / invoked_cnt;
+			rec->tsc_cycles = div_u64(rec->tsc_interval,
+						  invoked_cnt);
 		else
 			rec->tsc_cycles = rec->tsc_interval;
 	}
@@ -198,7 +200,7 @@ bool time_bench_calc_stats(struct time_bench_record *rec)
 						    &pmc_ipc_remainder);
 		/* Now get decimals .xxx precision (incorrect roundup)*/
 		pmc_ipc_tmp_rem = pmc_ipc_remainder;
-		pmc_ipc_div = rec->pmc_clk / 1000;
+		pmc_ipc_div = div_u64(rec->pmc_clk, 1000);
 		if (pmc_ipc_div > 0) {
 			rec->pmc_ipc_decimal = div_u64_rem(pmc_ipc_tmp_rem,
 							   pmc_ipc_div,
@@ -213,7 +215,7 @@ bool time_bench_calc_stats(struct time_bench_record *rec)
  * execution time stats.  The function being called/timed is assumed
  * to perform a tight loop, and update the timing record struct.
  */
-bool time_bench_loop(uint32_t loops, int step, char *txt, void *data,
+bool time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		     int (*func)(struct time_bench_record *record, void *data))
 {
 	struct time_bench_record rec;
@@ -223,7 +225,9 @@ bool time_bench_loop(uint32_t loops, int step, char *txt, void *data,
 	rec.version_abi = 1;
 	rec.loops       = loops;
 	rec.step        = step;
-	rec.flags       = (TIME_BENCH_LOOP | TIME_BENCH_TSC | TIME_BENCH_WALLCLOCK);
+	rec.flags       = TIME_BENCH_LOOP | TIME_BENCH_WALLCLOCK;
+	if (time_bench_has_tsc())
+		rec.flags |= TIME_BENCH_TSC;
 
 	/*** Loop function being timed ***/
 	if (!func(&rec, data)) {
@@ -238,11 +242,19 @@ bool time_bench_loop(uint32_t loops, int step, char *txt, void *data,
 	/* Calculate stats */
 	time_bench_calc_stats(&rec);
 
-	pr_info("Type:%s Per elem: %llu cycles(tsc) %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu tsc_interval:%llu)\n",
-		txt, rec.tsc_cycles, rec.ns_per_call_quotient,
-		rec.ns_per_call_decimal, rec.step, rec.time_sec,
-		rec.time_sec_remainder, rec.time_interval, rec.invoked_cnt,
-		rec.tsc_interval);
+	if (rec.flags & TIME_BENCH_TSC) {
+		pr_info("Type:%s Per elem: %llu cycles(tsc) %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu tsc_interval:%llu)\n",
+			txt, rec.tsc_cycles, rec.ns_per_call_quotient,
+			rec.ns_per_call_decimal, rec.step, rec.time_sec,
+			rec.time_sec_remainder, rec.time_interval,
+			rec.invoked_cnt, rec.tsc_interval);
+	} else {
+		pr_info("Type:%s Per elem: %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu)\n",
+			txt, rec.ns_per_call_quotient,
+			rec.ns_per_call_decimal, rec.step, rec.time_sec,
+			rec.time_sec_remainder, rec.time_interval,
+			rec.invoked_cnt);
+	}
 	if (rec.flags & TIME_BENCH_PMU)
 		pr_info("Type:%s PMU inst/clock%llu/%llu = %llu.%03llu IPC (inst per cycle)\n",
 			txt, rec.pmc_inst, rec.pmc_clk, rec.pmc_ipc_quotient,
@@ -292,11 +304,13 @@ void time_bench_print_stats_cpumask(const char *desc,
 				    struct time_bench_cpu *cpu_tasks,
 				    const struct cpumask *mask)
 {
+	bool has_tsc = false;
 	uint64_t average = 0;
 	int cpu;
 	int step = 0;
 	struct sum {
 		uint64_t tsc_cycles;
+		uint64_t ns_milli;
 		int records;
 	} sum = { 0 };
 
@@ -308,22 +322,47 @@ void time_bench_print_stats_cpumask(const char *desc,
 		/* Calculate stats */
 		time_bench_calc_stats(rec);
 
-		pr_info("Type:%s CPU(%d) %llu cycles(tsc) %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu tsc_interval:%llu)\n",
-			desc, cpu, rec->tsc_cycles, rec->ns_per_call_quotient,
-			rec->ns_per_call_decimal, rec->step, rec->time_sec,
-			rec->time_sec_remainder, rec->time_interval,
-			rec->invoked_cnt, rec->tsc_interval);
+		if (rec->flags & TIME_BENCH_TSC) {
+			has_tsc = true;
+			pr_info("Type:%s CPU(%d) %llu cycles(tsc) %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu tsc_interval:%llu)\n",
+				desc, cpu, rec->tsc_cycles,
+				rec->ns_per_call_quotient,
+				rec->ns_per_call_decimal, rec->step,
+				rec->time_sec, rec->time_sec_remainder,
+				rec->time_interval, rec->invoked_cnt,
+				rec->tsc_interval);
+		} else {
+			pr_info("Type:%s CPU(%d) %llu.%03llu ns (step:%d) - (measurement period time:%llu.%09u sec time_interval:%llu) - (invoke count:%llu)\n",
+				desc, cpu, rec->ns_per_call_quotient,
+				rec->ns_per_call_decimal, rec->step,
+				rec->time_sec, rec->time_sec_remainder,
+				rec->time_interval, rec->invoked_cnt);
+		}
 
 		/* Collect average */
 		sum.records++;
 		sum.tsc_cycles += rec->tsc_cycles;
+		sum.ns_milli += rec->ns_per_call_quotient * 1000 +
+				rec->ns_per_call_decimal;
 		step = rec->step;
 	}
 
-	if (sum.records) /* avoid div-by-zero */
-		average = sum.tsc_cycles / sum.records;
-	pr_info("Sum Type:%s Average: %llu cycles(tsc) CPUs:%d step:%d\n", desc,
-		average, sum.records, step);
+	if (has_tsc) {
+		if (sum.records) /* avoid div-by-zero */
+			average = div_u64(sum.tsc_cycles, sum.records);
+		pr_info("Sum Type:%s Average: %llu cycles(tsc) CPUs:%d step:%d\n",
+			desc, average, sum.records, step);
+	} else {
+		uint32_t avg_rem = 0;
+
+		if (sum.records) {
+			u64 avg_milli = div_u64(sum.ns_milli, sum.records);
+
+			average = div_u64_rem(avg_milli, 1000, &avg_rem);
+		}
+		pr_info("Sum Type:%s Average: %llu.%03u ns CPUs:%d step:%d\n",
+			desc, average, avg_rem, sum.records, step);
+	}
 }
 
 void time_bench_run_concurrent(uint32_t loops, int step, void *data,
@@ -355,8 +394,9 @@ void time_bench_run_concurrent(uint32_t loops, int step, void *data,
 		c->rec.version_abi = 1;
 		c->rec.loops       = loops;
 		c->rec.step        = step;
-		c->rec.flags       = (TIME_BENCH_LOOP | TIME_BENCH_TSC |
-				      TIME_BENCH_WALLCLOCK);
+		c->rec.flags       = TIME_BENCH_LOOP | TIME_BENCH_WALLCLOCK;
+		if (time_bench_has_tsc())
+			c->rec.flags |= TIME_BENCH_TSC;
 		c->rec.cpu = cpu;
 		c->bench_func = func;
 		c->task = kthread_run(invoke_test_on_cpu_func, c,
