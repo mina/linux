@@ -72,6 +72,7 @@ struct time_bench_cpu {
 	void *data;
 	/* Support masking outsome CPUs, mark if it ran */
 	bool did_bench_run;
+	bool failed;
 	/* int cpu; // note CPU stored in time_bench_record */
 	int (*bench_func)(struct time_bench_record *record, void *data);
 };
@@ -200,7 +201,7 @@ int time_bench_loop(uint32_t loops, int step, const char *txt, void *data,
 		    int (*func)(struct time_bench_record *rec, void *data));
 bool time_bench_calc_stats(struct time_bench_record *rec);
 
-void time_bench_run_concurrent(uint32_t loops, int step, void *data,
+bool time_bench_run_concurrent(uint32_t loops, int step, void *data,
 			       const struct cpumask *mask, /* Support masking outsome CPUs*/
 			       struct time_bench_sync *sync, struct time_bench_cpu *cpu_tasks,
 			       int (*func)(struct time_bench_record *record, void *data));
