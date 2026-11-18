@@ -26,7 +26,9 @@ static int verbose = 1;
 #define MY_RING_SMALL_SIZE	64
 #define MY_RING_OVERFLOW_BATCH	(MY_RING_SMALL_SIZE * 2)
 #define MY_HIGH_ORDER		2
-#define MY_LOOPS_MIN		1000UL
+#define MY_FRAG_SMALL_SIZE	256
+#define MY_LOOPS_MIN		\
+	max_t(unsigned long, 1000UL, (PAGE_SIZE / MY_FRAG_SMALL_SIZE) + 1)
 #define MY_LOOPS_MAX		10000000UL
 
 /* Makes tests selectable. Useful for perf-record to analyze a single test.
@@ -43,6 +45,7 @@ enum benchmark_bit {
 	bit_run_bench_bh_fast,
 	bit_run_bench_bh_ring_slow,
 	bit_run_bench_high_order,
+	bit_run_bench_frag,
 };
 
 #define enabled(b)	(run_flags & BIT(b))
@@ -610,6 +613,183 @@ static const struct pp_bench_cfg cfg_high_order_ring = {
 	.order = MY_HIGH_ORDER,
 };
 
+/* Fragment allocator: immediate free exercises BIAS_MAX & in-place reset */
+static int time_bench_frag_fast_reuse(struct time_bench_record *rec, void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = numa_mem_id(),
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	struct pp_stats_snap before;
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 i;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp))
+		return 0;
+
+	pp_snapshot_stats(pp, &before);
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (i = 0; i < rec->loops; i++) {
+		unsigned int offset;
+		netmem_ref netmem;
+
+		if (unlikely((i & 0xffff) == 0 && i))
+			pp_bh_yield();
+
+		netmem = page_pool_alloc_frag_netmem(pp, &offset,
+						     MY_FRAG_SMALL_SIZE,
+						     GFP_ATOMIC);
+		if (unlikely(!netmem))
+			break;
+		loops_cnt++;
+		barrier();
+		page_pool_put_full_netmem(pp, netmem, true);
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (loops_cnt < rec->loops ||
+	    !pp_verify_stats(pp, __func__, &before,
+			     PP_EXPECT_ALLOC_FAST | PP_EXPECT_RECYCLE_CACHED,
+			     0)) {
+		loops_cnt = 0;
+		rec->invoked_cnt = 0;
+	}
+
+	page_pool_destroy(pp);
+	return loops_cnt;
+}
+
+/* Hold one frag across page boundary to exercise slow page_pool_drain_frag();
+ * page_pool_destroy() cleans up the active pp->frag_page via
+ * page_pool_free_frag().
+ */
+static int time_bench_frag_slow_drain(struct time_bench_record *rec, void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = numa_mem_id(),
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	struct pp_stats_snap before;
+	netmem_ref held = 0;
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 i;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp))
+		return 0;
+
+	pp_snapshot_stats(pp, &before);
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (i = 0; i < rec->loops; i++) {
+		unsigned int offset;
+		netmem_ref netmem;
+
+		if (unlikely((i & 0xffff) == 0 && i))
+			pp_bh_yield();
+
+		netmem = page_pool_alloc_frag_netmem(pp, &offset, 1024,
+						     GFP_ATOMIC);
+		if (unlikely(!netmem))
+			break;
+		loops_cnt++;
+
+		if (offset == 0) {
+			if (held)
+				page_pool_put_full_netmem(pp, held, true);
+			held = netmem;
+		} else {
+			page_pool_put_full_netmem(pp, netmem, true);
+		}
+	}
+	if (held)
+		page_pool_put_full_netmem(pp, held, true);
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (loops_cnt < rec->loops ||
+	    !pp_verify_stats(pp, __func__, &before, PP_EXPECT_RECYCLE_CACHED,
+			     0)) {
+		loops_cnt = 0;
+		rec->invoked_cnt = 0;
+	}
+
+	page_pool_destroy(pp);
+	return loops_cnt;
+}
+
+/* Exercises page_pool_dev_alloc_va(), page_pool_free_va(), tail-room expansion
+ * in page_pool_alloc_netmem(), full-page (> PAGE_SIZE/2) branch, and
+ * page_pool_ref_page() / page_pool_unref_page().
+ */
+static int time_bench_frag_alloc_va(struct time_bench_record *rec, void *data)
+{
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.pool_size = MY_POOL_SIZE,
+		.nid = numa_mem_id(),
+		.dma_dir = DMA_BIDIRECTIONAL,
+	};
+	struct pp_stats_snap before;
+	struct page_pool *pp;
+	u64 loops_cnt = 0;
+	u32 i;
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp))
+		return 0;
+
+	pp_snapshot_stats(pp, &before);
+
+	local_bh_disable();
+	time_bench_start(rec);
+	for (i = 0; i < rec->loops; i++) {
+		unsigned int size = (i & 7) ? 1536 : (PAGE_SIZE - 512);
+		struct page *page;
+		void *va;
+
+		if (unlikely((i & 0xffff) == 0 && i))
+			pp_bh_yield();
+
+		va = page_pool_dev_alloc_va(pp, &size);
+		if (unlikely(!va))
+			break;
+
+		page = virt_to_head_page(va);
+		page_pool_ref_page(page);
+		if (unlikely(!page_pool_unref_page(page, 1))) {
+			loops_cnt = 0;
+			break;
+		}
+		loops_cnt++;
+		page_pool_free_va(pp, va, true);
+	}
+	time_bench_stop(rec, loops_cnt);
+	local_bh_enable();
+
+	if (loops_cnt < rec->loops ||
+	    !pp_verify_stats(pp, __func__, &before,
+			     PP_EXPECT_ALLOC_FAST | PP_EXPECT_RECYCLE_CACHED,
+			     0)) {
+		loops_cnt = 0;
+		rec->invoked_cnt = 0;
+	}
+
+	page_pool_destroy(pp);
+	return loops_cnt;
+}
+
 static int run_benchmark_tests(void)
 {
 	u32 nr_loops = loops;
@@ -655,6 +835,16 @@ static int run_benchmark_tests(void)
 		run_bench_case(nr_loops, 0, cfg_high_order_ring.name,
 			       (void *)&cfg_high_order_ring,
 			       time_bench_page_pool_cfg);
+	}
+
+	/* Fragment allocation & sub-page refcounting */
+	if (enabled(bit_run_bench_frag)) {
+		run_bench_case(nr_loops, 0, "bh-frag-fast-reuse", NULL,
+			       time_bench_frag_fast_reuse);
+		run_bench_case(nr_loops, 0, "bh-frag-slow-drain", NULL,
+			       time_bench_frag_slow_drain);
+		run_bench_case(nr_loops, 0, "bh-frag-alloc-va", NULL,
+			       time_bench_frag_alloc_va);
 	}
 
 	if (bench_failures) {
