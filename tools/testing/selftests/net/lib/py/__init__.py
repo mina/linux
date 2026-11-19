@@ -16,6 +16,7 @@ from .utils import CmdExitFailure, fd_read_timeout, cmd, bkg, defer, \
     bpftool, ip, ethtool, bpftrace, rand_port, rand_ports, wait_port_listen, \
     ctl_file_write, wait_file, tool, tc
 from .bpf import bpf_map_set, bpf_map_dump, bpf_prog_map_ids
+from .devmem import create_udmabuf, devmem_bind
 from .ynl import NlError, NlctrlFamily, YnlFamily, \
     EthtoolFamily, NetdevFamily, RtnlFamily, RtnlAddrFamily, RtnlRouteFamily
 from .ynl import NetshaperFamily, DevlinkFamily, GtpFamily, PSPFamily, Netlink
@@ -32,6 +33,7 @@ __all__ = ["KSRC",
            "bpftool", "ip", "ethtool", "bpftrace", "rand_port", "rand_ports",
            "wait_port_listen", "ctl_file_write", "wait_file", "tool", "tc",
            "bpf_map_set", "bpf_map_dump", "bpf_prog_map_ids",
+           "create_udmabuf", "devmem_bind",
            "NetdevSim", "NetdevSimDev",
            "NetshaperFamily", "DevlinkFamily", "GtpFamily", "PSPFamily",
            "NlError",
